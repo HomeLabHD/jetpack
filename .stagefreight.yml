@@ -9,7 +9,7 @@ matchers:
 
 vars:
   org: riffcc
-  github_org: riffcc
+  github_org: HomeLabHD   # our fork (PrPlanIT/HomeLabHD efforts) — safe outbound mirror target
   gitlab_group: riff.cc
   repo: jetpack
   github_repo: jetpack
@@ -53,6 +53,10 @@ forges:
     credentials: GITHUB
 
 repos:
+  # This GitLab repo is the AUTHORITATIVE primary. The dev's upstream
+  # (github.com/riffcc/jetpack) is pulled IN out-of-band (fork-update) and merged
+  # here — we never push to it. Our build/release lifecycle is mirrored OUT to our
+  # own fork, github.com/HomeLabHD/jetpack, which is safe to exercise fully.
   - id: primary
     forge: gitlab
     project: "{var:gitlab_group}/{var:repo}"
@@ -150,7 +154,7 @@ targets:
     aliases: ["v{version}", "latest"]
     when: { git_tags: [stable], events: [tag] }
 
-  # ── GitHub release (mirror) with binaries ────────────────────────
+  # ── GitHub release (our HomeLabHD fork) with binaries ────────────
   - id: github-release
     kind: release
     mirror: github-mirror
