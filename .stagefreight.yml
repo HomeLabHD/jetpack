@@ -9,7 +9,7 @@ matchers:
 
 vars:
   org: riffcc
-  github_org: riffcc
+  github_org: HomeLabHD   # our fork — github.com/HomeLabHD/jetpack; never the riffcc upstream
   gitlab_group: riff.cc
   repo: jetpack
   github_repo: jetpack
