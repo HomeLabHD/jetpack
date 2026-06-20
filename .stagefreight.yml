@@ -28,11 +28,15 @@ versioning:
     mode: error
 
 builds:
-  # The image is a regular multi-stage Dockerfile build. It produces the
-  # jetpack binary image (cargo build inside the Dockerfile).
+  # The image recycles the jetpack-bin binary: stage copies it into the build context
+  # as jetpack-<arch>, which the Dockerfile's `COPY jetpack-${TARGETARCH}` consumes —
+  # the compiled binary is reused, not recompiled inside the image.
   - id: jetpack
     kind: docker
     platforms: [linux/amd64]
+    stage:
+      from: jetpack-bin
+      as: "jetpack-{arch}"
 
   - id: jetpack-bin
     kind: binary
