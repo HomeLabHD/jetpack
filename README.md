@@ -5,6 +5,13 @@ deployment, orchestration, patching, and arbitrary task execution workflows.
 
 Jetpack is a GPLv3 licensed project, based on the original [Jetporch](https://github.com/jetporch/jetporch) project created and run by [Michael DeHaan](https://home.laserllama.net). [(<michael@michaeldehaan.net>)](mailto:michael@michaeldehaan.net).
 
+<!-- sf:project:start -->
+<!-- sf:project:end -->
+<!-- sf:badges:start -->
+<!-- sf:badges:end -->
+<!-- sf:image:start -->
+<!-- sf:image:end -->
+
 Links (currently outdated, will be updated soon)
 
 * [All Documentation](https://www.jetporch.com/)
