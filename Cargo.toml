@@ -32,7 +32,7 @@ sha2 = "0.11.0"
 hex = "0.4.3"
 guid-create = "0.5.2"
 expanduser = "1.2.2"
-indexmap = { version = "2.14.0", features = ["serde"] }
+indexmap = { version = "2.14.1", features = ["serde"] }
 chrono = "0.4.45"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 semver = "1.0.28"
