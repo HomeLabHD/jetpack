@@ -49,7 +49,7 @@ ci:
   forge:
     - gitlab
     - github
-  image: docker.cr.pcfae.com/prplanit/stagefreight:latest-dev
+  image: docker.cr.optcp.com/prplanit/stagefreight:latest-dev
 forges:
   preset: https://git.optcp.com/PrPlanIT/MaintenancePolicy//preset/forges.yml
 git:

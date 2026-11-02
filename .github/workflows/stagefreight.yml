@@ -26,7 +26,7 @@ jobs:
   audition:
     runs-on: ubuntu-latest
     container:
-      image: docker.cr.pcfae.com/prplanit/stagefreight:latest-dev
+      image: docker.cr.optcp.com/prplanit/stagefreight:latest-dev
     if: "${{ github.ref_type == 'tag' || !endsWith(github.event.head_commit.message, 'Generated-By: StageFreight') }}"
     continue-on-error: true
     permissions:
@@ -72,7 +72,7 @@ jobs:
   perform:
     runs-on: ubuntu-latest
     container:
-      image: docker.cr.pcfae.com/prplanit/stagefreight:latest-dev
+      image: docker.cr.optcp.com/prplanit/stagefreight:latest-dev
     needs: [audition]
     if: "${{ github.ref_type == 'tag' || !endsWith(github.event.head_commit.message, 'Generated-By: StageFreight') }}"
     permissions:
@@ -126,7 +126,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     container:
-      image: docker.cr.pcfae.com/prplanit/stagefreight:latest-dev
+      image: docker.cr.optcp.com/prplanit/stagefreight:latest-dev
     needs: [perform]
     if: "${{ github.ref_type == 'tag' || !endsWith(github.event.head_commit.message, 'Generated-By: StageFreight') }}"
     continue-on-error: true
@@ -173,7 +173,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     container:
-      image: docker.cr.pcfae.com/prplanit/stagefreight:latest-dev
+      image: docker.cr.optcp.com/prplanit/stagefreight:latest-dev
     needs: [perform, review]
     if: "${{ github.ref_type == 'tag' || !endsWith(github.event.head_commit.message, 'Generated-By: StageFreight') }}"
     continue-on-error: true
@@ -236,7 +236,7 @@ jobs:
   narrate:
     runs-on: ubuntu-latest
     container:
-      image: docker.cr.pcfae.com/prplanit/stagefreight:latest-dev
+      image: docker.cr.optcp.com/prplanit/stagefreight:latest-dev
     needs: [perform, review, publish]
     if: "${{ always() && (github.ref_type == 'tag' || !endsWith(github.event.head_commit.message, 'Generated-By: StageFreight')) }}"
     continue-on-error: true
