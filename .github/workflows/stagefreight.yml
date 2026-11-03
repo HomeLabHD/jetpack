@@ -37,7 +37,8 @@ jobs:
           {
             echo "SF_CI_PROVIDER=github"
             echo "SF_CI_EVENT=${{ github.event_name }}"
-            echo "SF_CI_BRANCH=${{ github.ref_name }}"
+            echo "SF_CI_BRANCH=${{ github.head_ref || github.ref_name }}"
+            echo "SF_CI_REF=${{ github.ref }}"
             echo "SF_CI_TAG=${{ github.ref_type == 'tag' && github.ref_name || '' }}"
             echo "SF_CI_SHA=${{ github.sha }}"
             echo "SF_CI_DEFAULT_BRANCH=${{ github.event.repository.default_branch }}"
@@ -84,7 +85,8 @@ jobs:
           {
             echo "SF_CI_PROVIDER=github"
             echo "SF_CI_EVENT=${{ github.event_name }}"
-            echo "SF_CI_BRANCH=${{ github.ref_name }}"
+            echo "SF_CI_BRANCH=${{ github.head_ref || github.ref_name }}"
+            echo "SF_CI_REF=${{ github.ref }}"
             echo "SF_CI_TAG=${{ github.ref_type == 'tag' && github.ref_name || '' }}"
             echo "SF_CI_SHA=${{ github.sha }}"
             echo "SF_CI_DEFAULT_BRANCH=${{ github.event.repository.default_branch }}"
@@ -102,6 +104,7 @@ jobs:
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=stagefreight" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
           echo "STAGEFREIGHT_OIDC=$token" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: audition
           path: .stagefreight
@@ -136,7 +139,8 @@ jobs:
           {
             echo "SF_CI_PROVIDER=github"
             echo "SF_CI_EVENT=${{ github.event_name }}"
-            echo "SF_CI_BRANCH=${{ github.ref_name }}"
+            echo "SF_CI_BRANCH=${{ github.head_ref || github.ref_name }}"
+            echo "SF_CI_REF=${{ github.ref }}"
             echo "SF_CI_TAG=${{ github.ref_type == 'tag' && github.ref_name || '' }}"
             echo "SF_CI_SHA=${{ github.sha }}"
             echo "SF_CI_DEFAULT_BRANCH=${{ github.event.repository.default_branch }}"
@@ -162,6 +166,7 @@ jobs:
         run: |
           stagefreight ci run review
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: review
           include-hidden-files: true
@@ -187,7 +192,8 @@ jobs:
           {
             echo "SF_CI_PROVIDER=github"
             echo "SF_CI_EVENT=${{ github.event_name }}"
-            echo "SF_CI_BRANCH=${{ github.ref_name }}"
+            echo "SF_CI_BRANCH=${{ github.head_ref || github.ref_name }}"
+            echo "SF_CI_REF=${{ github.ref }}"
             echo "SF_CI_TAG=${{ github.ref_type == 'tag' && github.ref_name || '' }}"
             echo "SF_CI_SHA=${{ github.sha }}"
             echo "SF_CI_DEFAULT_BRANCH=${{ github.event.repository.default_branch }}"
@@ -209,6 +215,7 @@ jobs:
           name: perform
           path: .stagefreight
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: review
           path: .stagefreight
@@ -226,6 +233,7 @@ jobs:
         run: |
           stagefreight ci run publish
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: publish
           include-hidden-files: true
@@ -246,7 +254,8 @@ jobs:
           {
             echo "SF_CI_PROVIDER=github"
             echo "SF_CI_EVENT=${{ github.event_name }}"
-            echo "SF_CI_BRANCH=${{ github.ref_name }}"
+            echo "SF_CI_BRANCH=${{ github.head_ref || github.ref_name }}"
+            echo "SF_CI_REF=${{ github.ref }}"
             echo "SF_CI_TAG=${{ github.ref_type == 'tag' && github.ref_name || '' }}"
             echo "SF_CI_SHA=${{ github.sha }}"
             echo "SF_CI_DEFAULT_BRANCH=${{ github.event.repository.default_branch }}"
@@ -263,10 +272,12 @@ jobs:
           name: perform
           path: .stagefreight
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: review
           path: .stagefreight
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: publish
           path: .stagefreight
