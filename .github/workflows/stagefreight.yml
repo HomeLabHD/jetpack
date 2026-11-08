@@ -252,7 +252,6 @@ jobs:
       options: --user root
     needs: [perform, review, publish]
     if: "${{ always() && (github.ref_type == 'tag' || !endsWith(github.event.head_commit.message, 'Generated-By: StageFreight')) }}"
-    continue-on-error: true
     steps:
       - name: stagefreight-context
         run: |
