@@ -29,6 +29,7 @@ builds:
     stage:
       as: jetpack-{arch}
       from: bin
+  preset: https://git.optcp.com/PrPlanIT/MaintenancePolicy//preset/build-docker.yml
 scribe:
   preset: https://git.optcp.com/PrPlanIT/MaintenancePolicy//preset/scribe-docker.yml
 lint:
@@ -114,5 +115,4 @@ upstream:
   preset: https://git.optcp.com/PrPlanIT/MaintenancePolicy//preset/upstream-fork.yml
   sources:
     upstream:
-      select:
-        prereleases: true
+      prereleases: true
