@@ -37,11 +37,14 @@ const MODULE: &str = "wait_for_others";
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct WaitForOthersTask {
     pub name: Option<String>,
     /// Barrier mode: "strict" or "loose" (default: "loose")
     pub mode: Option<String>,
     pub with: Option<PreLogicInput>,
+    pub retry: Option<String>,
+    pub delay: Option<String>,
     pub and: Option<PostLogicInput>,
 }
 
@@ -51,6 +54,10 @@ pub struct WaitForOthersAction {
 }
 
 impl IsTask for WaitForOthersTask {
+    fn name_variable_writes(&self) -> crate::tasks::naming::NameVariableWrites {
+        crate::tasks::naming::NameVariableWrites::None
+    }
+
     fn get_module(&self) -> String {
         String::from(MODULE)
     }
@@ -86,7 +93,14 @@ impl IsTask for WaitForOthersTask {
                 strict,
             }),
             with: Arc::new(PreLogicInput::template(handle, request, tm, &self.with)?),
-            and: Arc::new(PostLogicInput::template(handle, request, tm, &self.and)?),
+            and: Arc::new(PostLogicInput::template(
+                handle,
+                request,
+                tm,
+                &self.and,
+                &self.retry,
+                &self.delay,
+            )?),
         })
     }
 }

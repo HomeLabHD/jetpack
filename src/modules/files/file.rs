@@ -26,12 +26,15 @@ const MODULE: &str = "file";
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct FileTask {
     pub name: Option<String>,
     pub path: String,
     pub remove: Option<String>,
     pub attributes: Option<FileAttributesInput>,
     pub with: Option<PreLogicInput>,
+    pub retry: Option<String>,
+    pub delay: Option<String>,
     pub and: Option<PostLogicInput>,
 }
 struct FileAction {
@@ -41,6 +44,14 @@ struct FileAction {
 }
 
 impl IsTask for FileTask {
+    fn name_variable_writes(&self) -> crate::tasks::naming::NameVariableWrites {
+        crate::tasks::naming::NameVariableWrites::None
+    }
+
+    fn generated_name(&self, context: &crate::tasks::naming::NamingContext<'_>) -> Option<String> {
+        Some(context.removable("Ensure file", &self.remove, &self.path, "files"))
+    }
+
     fn get_module(&self) -> String {
         String::from(MODULE)
     }
@@ -71,7 +82,14 @@ impl IsTask for FileTask {
                 attributes: FileAttributesInput::template(handle, request, tm, &self.attributes)?,
             }),
             with: Arc::new(PreLogicInput::template(handle, request, tm, &self.with)?),
-            and: Arc::new(PostLogicInput::template(handle, request, tm, &self.and)?),
+            and: Arc::new(PostLogicInput::template(
+                handle,
+                request,
+                tm,
+                &self.and,
+                &self.retry,
+                &self.delay,
+            )?),
         })
     }
 }

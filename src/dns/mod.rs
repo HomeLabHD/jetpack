@@ -14,11 +14,32 @@
 //!
 //! Supports all OctoDNS providers: Gravity, Route53, Cloudflare, PowerDNS, etc.
 
+pub mod gravity;
 pub mod zone;
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, Mutex};
+
+/// Serializes DNS zone mutations across threads.
+///
+/// Parallel host provisioning calls `add_host_record` / `remove_host_record`
+/// concurrently; without this guard the zone-file read-modify-write in
+/// `zone.rs` (and the octodns/gravity sync that follows it) would race and lose
+/// updates. The record-mutating entry points below hold this lock for their
+/// entire body — zone edit plus provider sync — so a host's DNS change is
+/// atomic. Internal helpers (`add_ptr_record`, `sync`) deliberately take no
+/// lock: they are only reached through these entry points, and
+/// `std::sync::Mutex` is not reentrant.
+static DNS_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Acquire the process-wide DNS write lock, propagating poison as a `String`.
+fn dns_write_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    DNS_WRITE_LOCK
+        .lock()
+        .map_err(|e| format!("DNS write lock poisoned: {}", e))
+}
 
 /// Source of truth for IP addresses
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -64,6 +85,10 @@ pub struct DnsConfig {
     /// Reverse DNS zone (e.g., "10.10.10.in-addr.arpa")
     /// If set, PTR records are automatically created for provisioned hosts
     pub reverse_zone: Option<String>,
+
+    /// Native Gravity provider configuration. When present, record mutations
+    /// are pushed directly to the Gravity API instead of via OctoDNS sync.
+    pub gravity: Option<gravity::GravityConfig>,
 }
 
 fn default_true() -> bool {
@@ -119,11 +144,43 @@ impl DnsConfig {
     pub fn is_dns_authoritative(&self) -> bool {
         self.source_of_truth == DnsSourceOfTruth::Dns
     }
+
+    /// Whether a native Gravity provider is configured for direct record sync.
+    pub fn has_native_gravity(&self) -> bool {
+        self.gravity.is_some()
+    }
+
+    /// Anchor a relative `path` to `automation_root`, making it absolute. Absolute
+    /// paths are left untouched. This makes the README's "resolved relative to
+    /// the current repository root" promise hold, and it defeats a race where a
+    /// process `chdir` mid-batch would otherwise re-target
+    /// `current_dir(&config.path)` in [`sync`]. Uses [`Path::join`], never
+    /// `canonicalize`, so a not-yet-existing `dns/` tree still resolves.
+    pub fn resolve_path_against(&mut self, automation_root: &Path) {
+        let candidate = PathBuf::from(&self.path);
+        if !candidate.is_absolute() {
+            self.path = automation_root.join(&candidate).display().to_string();
+        }
+    }
+}
+
+/// Deserialize a [`DnsConfig`] from host variables and immediately anchor its
+/// `path` to `automation_root`. Returns `None` when the `dns:` block is absent or
+/// fails to deserialize. Centralizes resolution so every call site in
+/// `playbooks::traversal` produces paths anchored to the repo root.
+pub fn dns_config_from_vars(
+    value: &serde_yaml::Value,
+    automation_root: &Path,
+) -> Option<DnsConfig> {
+    let mut config: DnsConfig = serde_yaml::from_value(value.clone()).ok()?;
+    config.resolve_path_against(automation_root);
+    Some(config)
 }
 
 /// Add a DNS A record for a host, plus PTR if configured, and optionally sync
 /// inventory_name is the FQDN from inventory (e.g., "gravity01.island.lagun.co")
 pub fn add_host_record(config: &DnsConfig, inventory_name: &str, ip: &str) -> Result<bool, String> {
+    let _guard = dns_write_lock()?;
     let zone = config
         .zone
         .clone()
@@ -152,9 +209,20 @@ pub fn add_host_record(config: &DnsConfig, inventory_name: &str, ip: &str) -> Re
 
     // Sync to provider if auto_sync enabled
     if changed && config.auto_sync {
-        sync(config, &zone)?;
-        if ptr_changed && let Some(ref reverse_zone) = config.reverse_zone {
-            sync(config, reverse_zone)?;
+        if config.has_native_gravity() {
+            gravity::upsert_record(config, &zone, &hostname, "A", ip)?;
+            if ptr_changed && let Some(ref reverse_zone) = config.reverse_zone {
+                let host_part = ip
+                    .rsplit('.')
+                    .next()
+                    .ok_or_else(|| format!("Invalid IP: {}", ip))?;
+                gravity::upsert_record(config, reverse_zone, host_part, "PTR", &fqdn)?;
+            }
+        } else {
+            sync(config, &zone)?;
+            if ptr_changed && let Some(ref reverse_zone) = config.reverse_zone {
+                sync(config, reverse_zone)?;
+            }
         }
     }
 
@@ -164,6 +232,7 @@ pub fn add_host_record(config: &DnsConfig, inventory_name: &str, ip: &str) -> Re
 /// Remove a DNS A record for a host and optionally sync
 /// inventory_name is the FQDN from inventory (e.g., "gravity01.island.lagun.co")
 pub fn remove_host_record(config: &DnsConfig, inventory_name: &str) -> Result<bool, String> {
+    let _guard = dns_write_lock()?;
     let zone = config
         .zone
         .clone()
@@ -177,11 +246,22 @@ pub fn remove_host_record(config: &DnsConfig, inventory_name: &str) -> Result<bo
 
     let hostname = extract_hostname(inventory_name);
 
+    let previous_ip = zone::get_a_record(&config.zones_path(), &zone, &hostname)?;
+
     // Remove record from zone file
     let changed = zone::remove_a_record(&config.zones_path(), &zone, &hostname)?;
 
     if changed && config.auto_sync {
-        sync(config, &zone)?;
+        if config.has_native_gravity() {
+            gravity::delete_record(config, &zone, &hostname, "A")?;
+            if let (Some(ip), Some(reverse_zone)) = (previous_ip, config.reverse_zone.as_ref()) {
+                if let Some(host_part) = ip.rsplit('.').next() {
+                    gravity::delete_record(config, reverse_zone, host_part, "PTR")?;
+                }
+            }
+        } else {
+            sync(config, &zone)?;
+        }
     }
 
     Ok(changed)
@@ -194,7 +274,24 @@ pub fn set_service_records(
     service_name: &str,
     ips: &[String],
 ) -> Result<bool, String> {
-    zone::set_a_records(&config.zones_path(), zone, service_name, ips)
+    let _guard = dns_write_lock()?;
+    let changed = zone::set_a_records(&config.zones_path(), zone, service_name, ips)?;
+
+    if changed && config.auto_sync {
+        if config.has_native_gravity() {
+            gravity::replace_records(
+                config,
+                zone,
+                service_name,
+                "A",
+                &ips.iter().map(|ip| ip.as_str()).collect::<Vec<_>>(),
+            )?;
+        } else {
+            sync(config, zone)?;
+        }
+    }
+
+    Ok(changed)
 }
 
 /// Add a CNAME alias pointing to a target
@@ -204,7 +301,23 @@ pub fn add_cname_alias(
     alias: &str,
     target: &str,
 ) -> Result<bool, String> {
-    zone::add_cname_record(&config.zones_path(), zone, alias, target)
+    let _guard = dns_write_lock()?;
+    let changed = zone::add_cname_record(&config.zones_path(), zone, alias, target)?;
+
+    if changed && config.auto_sync {
+        if config.has_native_gravity() {
+            let target_fqdn = if target.ends_with('.') {
+                target.to_string()
+            } else {
+                format!("{}.", target)
+            };
+            gravity::replace_records(config, zone, alias, "CNAME", &[target_fqdn.as_str()])?;
+        } else {
+            sync(config, zone)?;
+        }
+    }
+
+    Ok(changed)
 }
 
 /// Add a PTR record for reverse DNS
@@ -226,7 +339,18 @@ pub fn add_ptr_record(config: &DnsConfig, ip: &str, fqdn: &str) -> Result<bool, 
 
 /// Remove a record (A, CNAME, or PTR)
 pub fn remove_record(config: &DnsConfig, zone: &str, name: &str) -> Result<bool, String> {
-    zone::remove_a_record(&config.zones_path(), zone, name)
+    let _guard = dns_write_lock()?;
+    let changed = zone::remove_a_record(&config.zones_path(), zone, name)?;
+
+    if changed && config.auto_sync {
+        if config.has_native_gravity() {
+            gravity::delete_hostname_records(config, zone, name)?;
+        } else {
+            sync(config, zone)?;
+        }
+    }
+
+    Ok(changed)
 }
 
 /// Sync zone to providers via OctoDNS
@@ -266,4 +390,84 @@ pub fn sync(config: &DnsConfig, zone: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config(path: &str) -> DnsConfig {
+        DnsConfig {
+            path: path.to_string(),
+            zone: None,
+            source_of_truth: DnsSourceOfTruth::default(),
+            auto_sync: true,
+            aliases: Default::default(),
+            reverse_zone: None,
+            gravity: None,
+        }
+    }
+
+    #[test]
+    fn resolve_path_joins_relative_path_to_automation_root() {
+        let mut config = make_config("dns/riff.cc");
+        config.resolve_path_against(std::path::Path::new("/repo"));
+        assert_eq!(config.path, "/repo/dns/riff.cc");
+    }
+
+    #[test]
+    fn resolve_path_leaves_absolute_path_untouched() {
+        let mut config = make_config("/srv/dns/riff.cc");
+        config.resolve_path_against(std::path::Path::new("/repo"));
+        assert_eq!(config.path, "/srv/dns/riff.cc");
+    }
+
+    #[test]
+    fn resolve_path_with_empty_root_stays_relative() {
+        // an empty repo root (no detection) must not corrupt the path
+        let mut config = make_config("dns/riff.cc");
+        config.resolve_path_against(std::path::Path::new(""));
+        assert_eq!(config.path, "dns/riff.cc");
+    }
+
+    #[test]
+    fn from_vars_anchors_relative_path_to_automation_root() {
+        let mut mapping = serde_yaml::Mapping::new();
+        mapping.insert(
+            serde_yaml::Value::String("path".to_string()),
+            serde_yaml::Value::String("dns/riff.cc".to_string()),
+        );
+        let config = dns_config_from_vars(
+            &serde_yaml::Value::Mapping(mapping),
+            std::path::Path::new("/repo"),
+        )
+        .expect("dns block deserializes");
+        assert_eq!(config.path, "/repo/dns/riff.cc");
+        // downstream paths inherit the anchored root — this is the bug fix
+        assert_eq!(
+            config.zones_path(),
+            PathBuf::from("/repo/dns/riff.cc/zones")
+        );
+    }
+
+    #[test]
+    fn from_vars_keeps_absolute_path_from_host_vars() {
+        let mut mapping = serde_yaml::Mapping::new();
+        mapping.insert(
+            serde_yaml::Value::String("path".to_string()),
+            serde_yaml::Value::String("/srv/dns/riff.cc".to_string()),
+        );
+        let config = dns_config_from_vars(
+            &serde_yaml::Value::Mapping(mapping),
+            std::path::Path::new("/repo"),
+        )
+        .expect("dns block deserializes");
+        assert_eq!(config.path, "/srv/dns/riff.cc");
+    }
+
+    #[test]
+    fn from_vars_returns_none_for_non_mapping() {
+        let none = dns_config_from_vars(&serde_yaml::Value::Null, std::path::Path::new("/repo"));
+        assert!(none.is_none());
+    }
 }

@@ -9,7 +9,17 @@ use crate::playbooks::templar::{Templar, TemplateMode};
 use crate::provisioners::{ProvisionConfig, ProvisionResult, Provisioner};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+
+/// Serializes VMID allocation + empty-VM creation.
+///
+/// Proxmox `/cluster/nextid` returns max+1 without reserving it, so two hosts
+/// created in parallel on the same cluster can be handed the same VMID and
+/// collide at create time. Holding this across `get_next_vmid` →
+/// `create_empty_vm` makes parallel provisioning safe. VM creation is a single
+/// API call (~1s); PXE imaging (~90s) still runs in parallel afterward, so this
+/// serializes only the cheap part.
+static VMID_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub struct ProxmoxVmProvisioner;
 
@@ -90,6 +100,7 @@ impl ProxmoxVmProvisioner {
             cluster: self.template_string(&templar, &config.cluster, vars)?,
             node: self.template_option(&templar, &config.node, vars)?,
             hostname: self.template_option(&templar, &config.hostname, vars)?,
+            ip: self.template_option(&templar, &config.ip, vars)?,
             vmid: self.template_option(&templar, &config.vmid, vars)?,
             memory: self.template_option(&templar, &config.memory, vars)?,
             cores: self.template_option(&templar, &config.cores, vars)?,
@@ -216,7 +227,7 @@ impl ProxmoxVmProvisioner {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| format!("HTTP: {}", e))?;
             let mut params = HashMap::new();
@@ -286,7 +297,7 @@ impl ProxmoxVmProvisioner {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| format!("HTTP: {}", e))?;
             let resp = self
@@ -323,7 +334,7 @@ impl ProxmoxVmProvisioner {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| format!("HTTP: {}", e))?;
             let resp = self
@@ -363,7 +374,7 @@ impl ProxmoxVmProvisioner {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| format!("HTTP: {}", e))?;
 
@@ -466,11 +477,17 @@ impl ProxmoxVmProvisioner {
                 None
             };
 
-            // If we didn't specify MAC, query the VM to get the generated one
-            if mac.is_none()
-                && let Ok(Some(generated_mac)) = self.get_vm_mac(conn, vmid).await
-            {
-                return Ok(generated_mac);
+            // If we didn't specify MAC, the VM was just created — wait for the
+            // creation task (UPID) to complete via Proxmox's tasks API, then
+            // read the generated MAC from the now-available config.
+            if mac.is_none() {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                if let Some(upid) = body.get("data").and_then(|d| d.as_str()) {
+                    self.wait_for_task(conn, upid).await?;
+                }
+                if let Ok(Some(generated_mac)) = self.get_vm_mac(conn, vmid).await {
+                    return Ok(generated_mac);
+                }
             }
 
             Ok(mac.unwrap_or_default())
@@ -484,7 +501,7 @@ impl ProxmoxVmProvisioner {
     ) -> Result<Option<String>, String> {
         let url = self.api_url(conn, &format!("/nodes/{}/qemu/{}/config", conn.node, vmid));
         let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+            .tls_danger_accept_invalid_certs(true)
             .build()
             .map_err(|e| format!("HTTP: {}", e))?;
 
@@ -532,7 +549,7 @@ impl ProxmoxVmProvisioner {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| format!("HTTP: {}", e))?;
             let _ = self.apply_auth(conn, client.post(&url)).send().await;
@@ -540,10 +557,64 @@ impl ProxmoxVmProvisioner {
         })
     }
 
-    fn delete_vm(&self, conn: &ClusterConnection, vmid: u64) -> Result<(), String> {
-        let _ = self.stop_vm(conn, vmid);
-        std::thread::sleep(std::time::Duration::from_secs(3));
+    /// Current VM status string (e.g. "running", "stopped"), or `None` if the VM
+    /// does not exist (non-2xx from `/status/current`).
+    fn vm_status(&self, conn: &ClusterConnection, vmid: u64) -> Result<Option<String>, String> {
+        let url = self.api_url(
+            conn,
+            &format!("/nodes/{}/qemu/{}/status/current", conn.node, vmid),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Runtime: {}", e))?;
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .tls_danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| format!("HTTP: {}", e))?;
+            let resp = self
+                .apply_auth(conn, client.get(&url))
+                .send()
+                .await
+                .map_err(|e| format!("API: {}", e))?;
+            if !resp.status().is_success() {
+                return Ok(None);
+            }
+            #[derive(serde::Deserialize)]
+            struct Wrapper {
+                data: Option<Status>,
+            }
+            #[derive(serde::Deserialize)]
+            struct Status {
+                status: String,
+            }
+            let w: Wrapper = resp.json().await.map_err(|e| format!("Parse: {}", e))?;
+            Ok(w.data.map(|s| s.status))
+        })
+    }
 
+    /// Bounded readiness check: poll until the VM reports `stopped` (or is gone).
+    /// Replaces the old blind `sleep 3` before DELETE — same poll-until-ready
+    /// shape as `wait_for_ssh` / `wait_for_http`.
+    fn wait_for_stopped(&self, conn: &ClusterConnection, vmid: u64) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match self.vm_status(conn, vmid)? {
+                None => return Ok(()),
+                Some(status) if status == "stopped" => return Ok(()),
+                Some(_) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("timed out waiting for VM {} to stop", vmid));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    fn delete_vm(&self, conn: &ClusterConnection, vmid: u64) -> Result<(), String> {
+        // Pure DELETE — the caller ensures the VM is stopped first (see `destroy`
+        // / `stop`). No stop, no blind sleep.
         let url = self.api_url(conn, &format!("/nodes/{}/qemu/{}", conn.node, vmid));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -552,7 +623,7 @@ impl ProxmoxVmProvisioner {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| format!("HTTP: {}", e))?;
 
@@ -568,6 +639,247 @@ impl ProxmoxVmProvisioner {
             }
             Ok(())
         })
+    }
+
+    /// Wait for a Proxmox async task (UPID) to complete via the tasks API —
+    /// the native mechanism for Proxmox async operations.
+    async fn wait_for_task(&self, conn: &ClusterConnection, upid: &str) -> Result<(), String> {
+        let url = self.api_url(conn, &format!("/nodes/{}/tasks/{}/status", conn.node, upid));
+        loop {
+            let client = reqwest::Client::builder()
+                .tls_danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| format!("HTTP: {}", e))?;
+            let resp = self
+                .apply_auth(conn, client.get(&url))
+                .send()
+                .await
+                .map_err(|e| format!("Task status: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("Task status query failed: {}", resp.status()));
+            }
+            #[derive(serde::Deserialize)]
+            struct Wrapper {
+                data: Option<TaskStatus>,
+            }
+            #[derive(serde::Deserialize)]
+            struct TaskStatus {
+                status: String,
+                exitstatus: Option<String>,
+            }
+            let wrapper: Wrapper = resp
+                .json()
+                .await
+                .map_err(|e| format!("Parse task status: {}", e))?;
+            if let Some(task) = wrapper.data
+                && task.status == "stopped"
+            {
+                if let Some(exit) = &task.exitstatus
+                    && exit != "OK"
+                {
+                    return Err(format!("Proxmox task failed ({}): {}", upid, exit));
+                }
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Resolve a VM's MAC synchronously (wraps the async get_vm_mac for callers
+    /// that aren't already in an async context, like ensure_exists).
+    fn vm_mac(&self, conn: &ClusterConnection, vmid: u64) -> Result<Option<String>, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Runtime: {}", e))?;
+        rt.block_on(self.get_vm_mac(conn, vmid))
+    }
+}
+
+/// Trigger Dragonfly imaging for a machine: register (if no machine_id is
+/// given), assign the OS template, then kick off the reimage workflow.
+/// Best-effort — every failure is logged and swallowed, so a Dragonfly outage
+/// never blocks VM creation or a run.
+fn trigger_dragonfly_imaging(
+    dragonfly: &crate::provisioners::dragonfly::DragonflyClient,
+    mac: &str,
+    ip: Option<&str>,
+    hostname: &str,
+    network: &crate::provisioners::dragonfly::NetworkSpec,
+    os: Option<&str>,
+    proxmox: Option<&crate::provisioners::dragonfly::ProxmoxSource>,
+) {
+    // admin/create upserts by MAC. With `ip` it sets StaticIpv4 + the full
+    // network config; without, DHCP. Either way Dragonfly gets the Proxmox
+    // source (needed for reboot-pxe on reimage).
+    let machine_id = match dragonfly.admin_create_machine(mac, ip, Some(hostname), network, proxmox)
+    {
+        Ok(reg) => {
+            eprintln!(
+                "Dragonfly: {} {} (MAC {}) as machine {}",
+                if reg.created { "created" } else { "updated" },
+                hostname,
+                mac,
+                reg.machine_id
+            );
+            reg.machine_id
+        }
+        Err(e) => {
+            eprintln!(
+                "Dragonfly: WARNING: admin/create {} (MAC {}) failed: {}",
+                hostname, mac, e
+            );
+            return;
+        }
+    };
+    // Set hostname explicitly — register's hostname doesn't always stick (the
+    // PXE agent may report "localhost" on first check-in).
+    if let Err(e) = dragonfly.set_hostname(&machine_id, hostname) {
+        eprintln!(
+            "Dragonfly: WARNING: set_hostname for {} failed: {}",
+            hostname, e
+        );
+    }
+    if let Some(os) = os
+        && let Err(e) = dragonfly.assign_os(&machine_id, os)
+    {
+        eprintln!(
+            "Dragonfly: WARNING: assign_os({}) for {} failed: {}",
+            os, hostname, e
+        );
+    }
+    match dragonfly.reimage(&machine_id) {
+        Ok(()) => eprintln!("Dragonfly: reimaging {} (machine {})", hostname, machine_id),
+        Err(e) => eprintln!(
+            "Dragonfly: WARNING: reimage for {} (machine {}) failed: {}",
+            hostname, machine_id, e
+        ),
+    }
+}
+
+/// Converge a VM's Dragonfly imaging state: if the machine isn't `Installed`,
+/// (re-)trigger assign_os + reimage; if already `Installed`, leave it alone
+/// (never re-image a working host). Best-effort; lookup errors are warned.
+fn converge_dragonfly(
+    dragonfly: &crate::provisioners::dragonfly::DragonflyClient,
+    mac: &str,
+    ip: Option<&str>,
+    hostname: &str,
+    network: &crate::provisioners::dragonfly::NetworkSpec,
+    os: Option<&str>,
+    proxmox: Option<&crate::provisioners::dragonfly::ProxmoxSource>,
+) {
+    match dragonfly.find_machine_by_mac(mac) {
+        Ok(None) => {
+            eprintln!(
+                "Dragonfly: {} not registered yet — precreating + imaging",
+                hostname
+            );
+            trigger_dragonfly_imaging(dragonfly, mac, ip, hostname, network, os, proxmox);
+        }
+        Ok(Some(m)) if m.is_installed() => {
+            eprintln!("Dragonfly: {} already Installed — no action", hostname);
+        }
+        Ok(Some(m)) => {
+            // Registered with Dragonfly but not yet `Installed`. Do NOT reimage:
+            // the machine may be mid-imaging, or finished-but-not-yet-marked
+            // (the `Installed` mark is set by the workflow's reboot/kexec
+            // action_started handoff — the pre-boot agent committing to the
+            // finished OS — NOT by Proxmox power state). Re-imaging here cancels
+            // its workflow and wipes a freshly-installed box (#26). A stalled
+            // install is recovered by rebooting (re-PXE → the idempotent
+            // workflow resumes), not by reimage. Reimage is explicit-only.
+            eprintln!(
+                "Dragonfly: {} registered (status: {}) — no implicit reimage (#26)",
+                hostname, m.status
+            );
+        }
+        Err(e) => eprintln!(
+            "Dragonfly: WARNING: lookup for {} (MAC {}) failed: {}",
+            hostname, mac, e
+        ),
+    }
+}
+
+#[cfg(test)]
+mod converge_tests {
+    use super::*;
+    use crate::provisioners::dragonfly::NetworkSpec;
+    use crate::provisioners::dragonfly::tests::{MockServer, client};
+
+    /// #26: a machine that is registered with Dragonfly but not yet `Installed`
+    /// (mid-imaging, or finished-but-not-yet-marked) must NOT be re-imaged by a
+    /// converge run — re-imaging cancels its workflow and wipes a freshly-
+    /// installed box. Only an *unregistered* machine (None) is imaged here.
+    #[test]
+    fn converge_does_not_reimage_registered_non_installed_machine() {
+        // The by-MAC lookup returns a registered, non-Installed machine. Every
+        // other endpoint is answered so that a *wrong* re-image would fully
+        // execute and be recorded (so this test fails loudly, not silently).
+        let server = MockServer::start(|req| {
+            if req.method == "GET" && req.path.starts_with("/api/machines/by-mac/") {
+                (200, r#"{"id":"m1","status":"Installing"}"#.to_string())
+            } else if req.path.ends_with("/reimage") {
+                (200, "{}".to_string())
+            } else if req.path.ends_with("/os") {
+                (200, "{}".to_string())
+            } else if req.path.ends_with("/hostname") {
+                (200, "{}".to_string())
+            } else {
+                // admin/create
+                (200, r#"{"machine_id":"m1","created":false}"#.to_string())
+            }
+        });
+        let c = client(&server.url());
+        converge_dragonfly(
+            &c,
+            "BC:24:11:22:33:44",
+            None,
+            "k8s06",
+            &NetworkSpec::default(),
+            Some("debian-13"),
+            None,
+        );
+        let reimaged = server
+            .recorded()
+            .iter()
+            .any(|r| r.method == "POST" && r.path.contains("/reimage"));
+        assert!(
+            !reimaged,
+            "converge must NOT reimage a registered non-Installed machine (#26)"
+        );
+    }
+
+    /// A machine not yet registered with Dragonfly (None) is still imaged — the
+    /// create path is unchanged by the #26 fix.
+    #[test]
+    fn converge_images_unregistered_machine() {
+        let server = MockServer::start(|req| {
+            if req.method == "GET" && req.path.starts_with("/api/machines/by-mac/") {
+                // not registered → 404 → None → image it
+                (404, r#"{"error":"Not Found"}"#.to_string())
+            } else {
+                (200, r#"{"machine_id":"m1","created":true}"#.to_string())
+            }
+        });
+        let c = client(&server.url());
+        converge_dragonfly(
+            &c,
+            "BC:24:11:22:33:44",
+            None,
+            "newhost",
+            &NetworkSpec::default(),
+            Some("debian-13"),
+            None,
+        );
+        let reimaged = server
+            .recorded()
+            .iter()
+            .any(|r| r.method == "POST" && r.path.contains("/reimage"));
+        assert!(
+            reimaged,
+            "converge must image an unregistered machine (create path unchanged)"
+        );
     }
 }
 
@@ -596,7 +908,7 @@ impl Provisioner for ProxmoxVmProvisioner {
 
             return rt.block_on(async {
                 let client = reqwest::Client::builder()
-                    .danger_accept_invalid_certs(true)
+                    .tls_danger_accept_invalid_certs(true)
                     .build()
                     .map_err(|e| format!("HTTP: {}", e))?;
                 let resp = self
@@ -632,59 +944,74 @@ impl Provisioner for ProxmoxVmProvisioner {
         let config = self.template_config(config, &host_vars)?;
         let conn = self.get_cluster_connection(&config, inventory)?;
         let hostname = config.hostname.as_deref().unwrap_or(inventory_name);
+        let os = crate::provisioners::dragonfly::var(&host_vars, "dragonfly_os_template");
+        let dragonfly = crate::provisioners::dragonfly::DragonflyClient::try_from_vars(&host_vars);
+        let network = crate::provisioners::dragonfly::NetworkSpec::from_vars(&host_vars);
 
-        // Check if exists
-        if self.find_vm(&conn, hostname)?.is_some() {
+        // Exists → converge: if the VM exists but Dragonfly hasn't finished imaging
+        // it (e.g. stuck at "No OS"), re-trigger assign_os + reimage. An already-
+        // Installed machine is left untouched. No-op when Dragonfly isn't configured.
+        if let Some(vmid) = self.find_vm(&conn, hostname)? {
+            if let Some(ref dragonfly) = dragonfly
+                && let Some(mac) = self.vm_mac(&conn, vmid)?
+            {
+                let proxmox = crate::provisioners::dragonfly::ProxmoxSource {
+                    proxmox_type: "vm".to_string(),
+                    cluster: config.cluster.clone(),
+                    node: conn.node.clone(),
+                    vmid,
+                };
+                converge_dragonfly(
+                    dragonfly,
+                    &mac,
+                    config.ip.as_deref(),
+                    hostname,
+                    &network,
+                    os.as_deref(),
+                    Some(&proxmox),
+                );
+            }
             return Ok(ProvisionResult::AlreadyExists);
         }
 
-        // Get VMID - use specified or auto-assign from Proxmox
-        let vmid = if let Some(ref vmid_str) = config.vmid {
-            vmid_str
+        // Absent → create + image: create the VM, then register + assign_os +
+        // reimage with Dragonfly so it images on PXE boot. Best-effort — a
+        // Dragonfly outage must never block VM creation; the VM still PXEs and
+        // Dragonfly discovers it by MAC.
+        // Allocate the VMID and create the empty VM. When the VMID is
+        // auto-assigned, hold VMID_LOCK across nextid+create so parallel hosts
+        // on the same cluster don't collide on the non-reserving nextid API.
+        let (vmid, mac) = if let Some(ref vmid_str) = config.vmid {
+            let vmid = vmid_str
                 .parse::<u64>()
-                .map_err(|_| "Invalid vmid".to_string())?
+                .map_err(|_| "Invalid vmid".to_string())?;
+            (vmid, self.create_empty_vm(&conn, &config, hostname, vmid)?)
         } else {
-            self.get_next_vmid(&conn)?
+            let _guard = VMID_LOCK
+                .lock()
+                .map_err(|e| format!("VMID lock poisoned: {}", e))?;
+            let vmid = self.get_next_vmid(&conn)?;
+            (vmid, self.create_empty_vm(&conn, &config, hostname, vmid)?)
         };
 
-        // Create empty VM for PXE boot
-        let mac = self.create_empty_vm(&conn, &config, hostname, vmid)?;
-
-        // Log MAC, then run the Dragonfly post-create hook (opt-in via
-        // dragonfly_api_url + _token vars): pre-register the PXE VM so Dragonfly
-        // images it on boot, and optionally assign its OS template. Best-effort
-        // by design — a Dragonfly outage must never block VM creation; the VM
-        // still PXEs and Dragonfly discovers it by MAC regardless.
         if !mac.is_empty() {
             eprintln!("VM {} created with MAC: {}", hostname, mac);
-            if let Some(dragonfly) =
-                crate::provisioners::dragonfly::DragonflyClient::try_from_vars(&host_vars)
-            {
-                match dragonfly.register_machine(&mac, Some(hostname)) {
-                    Ok(reg) => {
-                        eprintln!(
-                            "Dragonfly: registered {} (MAC {}) as machine {}",
-                            hostname, mac, reg.machine_id
-                        );
-                        if let Some(os) =
-                            crate::provisioners::dragonfly::var(&host_vars, "dragonfly_os_template")
-                        {
-                            match dragonfly.assign_os(&reg.machine_id, &os) {
-                                Ok(()) => {
-                                    eprintln!("Dragonfly: assigned OS {} to {}", os, hostname)
-                                }
-                                Err(e) => eprintln!(
-                                    "Dragonfly: WARNING: assign_os({}) for {} failed: {}",
-                                    os, hostname, e
-                                ),
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!(
-                        "Dragonfly: WARNING: register {} (MAC {}) failed: {}",
-                        hostname, mac, e
-                    ),
-                }
+            if let Some(ref dragonfly) = dragonfly {
+                let proxmox = crate::provisioners::dragonfly::ProxmoxSource {
+                    proxmox_type: "vm".to_string(),
+                    cluster: config.cluster.clone(),
+                    node: conn.node.clone(),
+                    vmid,
+                };
+                trigger_dragonfly_imaging(
+                    dragonfly,
+                    &mac,
+                    config.ip.as_deref(),
+                    hostname,
+                    &network,
+                    os.as_deref(),
+                    Some(&proxmox),
+                );
             }
         }
 
@@ -697,10 +1024,6 @@ impl Provisioner for ProxmoxVmProvisioner {
         inventory_name: &str,
         inventory: &Arc<RwLock<Inventory>>,
     ) -> Result<Option<String>, String> {
-        // Resolve the DHCP-assigned IP from Dragonfly after PXE boot. Opt out
-        // entirely when Dragonfly isn't configured so non-Dragonfly deployments
-        // are unchanged. Best-effort: callers (.ok().flatten()) treat any error
-        // as "no IP known".
         let inv_name = inventory_name.to_string();
         let host_vars = {
             let inv = inventory.read().map_err(|e| format!("Inventory: {}", e))?;
@@ -712,6 +1035,17 @@ impl Provisioner for ProxmoxVmProvisioner {
                 serde_yaml::Mapping::new()
             }
         };
+        let templated = self.template_config(config, &host_vars)?;
+
+        // A declared static IP is the SSH target — cloud-init bakes it on the
+        // Dragonfly side, so there's nothing to discover via DHCP.
+        if let Some(ip) = &templated.ip {
+            return Ok(Some(ip.clone()));
+        }
+
+        // No static IP → resolve the DHCP-assigned IP from Dragonfly after PXE
+        // boot. Opt out when Dragonfly isn't configured so non-Dragonfly
+        // deployments are unchanged. Best-effort: callers treat errors as "no IP".
         let dragonfly =
             match crate::provisioners::dragonfly::DragonflyClient::try_from_vars(&host_vars) {
                 Some(d) => d,
@@ -721,7 +1055,6 @@ impl Provisioner for ProxmoxVmProvisioner {
         // Recover the VM's MAC from Proxmox (works for auto-generated MACs, which
         // Proxmox stores in the VM config after creation), then ask Dragonfly for
         // that MAC's current lease.
-        let templated = self.template_config(config, &host_vars)?;
         let conn = self.get_cluster_connection(&templated, inventory)?;
         let hostname = templated.hostname.as_deref().unwrap_or(inventory_name);
         let Some(vmid) = self.find_vm(&conn, hostname)? else {
@@ -748,10 +1081,46 @@ impl Provisioner for ProxmoxVmProvisioner {
     ) -> Result<(), String> {
         let conn = self.get_cluster_connection(config, inventory)?;
         let hostname = config.hostname.as_deref().unwrap_or(inventory_name);
+        let state = crate::provisioners::ProvisionState::parse(&config.state)?;
 
         if let Some(vmid) = self.find_vm(&conn, hostname)? {
+            // "live" = anything not safely stopped (running, paused, …).
+            let is_live = self
+                .vm_status(&conn, vmid)?
+                .map(|s| s != "stopped")
+                .unwrap_or(false);
+            crate::provisioners::refuse_destroy_if_running(state, is_live)
+                .map_err(|e| format!("cannot destroy {}: {}", hostname, e))?;
+            if is_live {
+                // state: destroyed / force-absent — stop, wait, then delete.
+                self.stop_vm(&conn, vmid)?;
+                self.wait_for_stopped(&conn, vmid)?;
+            }
             self.delete_vm(&conn, vmid)?;
         }
         Ok(())
+    }
+
+    fn stop(
+        &self,
+        config: &ProvisionConfig,
+        inventory_name: &str,
+        inventory: &Arc<RwLock<Inventory>>,
+    ) -> Result<ProvisionResult, String> {
+        let conn = self.get_cluster_connection(config, inventory)?;
+        let hostname = config.hostname.as_deref().unwrap_or(inventory_name);
+        if let Some(vmid) = self.find_vm(&conn, hostname)? {
+            let is_live = self
+                .vm_status(&conn, vmid)?
+                .map(|s| s != "stopped")
+                .unwrap_or(false);
+            if is_live {
+                self.stop_vm(&conn, vmid)?;
+                self.wait_for_stopped(&conn, vmid)?;
+                return Ok(ProvisionResult::Stopped);
+            }
+        }
+        // Absent or already stopped — desired state reached, no action.
+        Ok(ProvisionResult::AlreadyExists)
     }
 }

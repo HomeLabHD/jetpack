@@ -47,6 +47,7 @@ const MODULE: &str = "proxmox_node";
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct ProxmoxNodeTask {
     pub name: Option<String>,
     pub api_host: String,
@@ -62,6 +63,8 @@ pub struct ProxmoxNodeTask {
     /// If true, also list LXCs on this node
     pub include_lxc: Option<String>,
     pub with: Option<PreLogicInput>,
+    pub retry: Option<String>,
+    pub delay: Option<String>,
     pub and: Option<PostLogicInput>,
 }
 
@@ -75,6 +78,10 @@ struct ProxmoxNodeAction {
 }
 
 impl IsTask for ProxmoxNodeTask {
+    fn name_variable_writes(&self) -> crate::tasks::naming::NameVariableWrites {
+        crate::tasks::naming::NameVariableWrites::saved(self.save_to.as_deref())
+    }
+
     fn get_module(&self) -> String {
         String::from(MODULE)
     }
@@ -142,7 +149,14 @@ impl IsTask for ProxmoxNodeTask {
                 )?,
             }),
             with: Arc::new(PreLogicInput::template(handle, request, tm, &self.with)?),
-            and: Arc::new(PostLogicInput::template(handle, request, tm, &self.and)?),
+            and: Arc::new(PostLogicInput::template(
+                handle,
+                request,
+                tm,
+                &self.and,
+                &self.retry,
+                &self.delay,
+            )?),
         })
     }
 }

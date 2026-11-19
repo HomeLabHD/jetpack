@@ -24,6 +24,7 @@ const MODULE: &str = "Move";
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct MoveTask {
     pub name: Option<String>,
     pub src: String,
@@ -34,6 +35,8 @@ pub struct MoveTask {
     pub backup: Option<String>,
     pub force: Option<String>,
     pub with: Option<PreLogicInput>,
+    pub retry: Option<String>,
+    pub delay: Option<String>,
     pub and: Option<PostLogicInput>,
 }
 
@@ -48,6 +51,14 @@ struct MoveAction {
 }
 
 impl IsTask for MoveTask {
+    fn name_variable_writes(&self) -> crate::tasks::naming::NameVariableWrites {
+        crate::tasks::naming::NameVariableWrites::None
+    }
+
+    fn generated_name(&self, context: &crate::tasks::naming::NamingContext<'_>) -> Option<String> {
+        Some(context.resource("Move file to", &self.dest, "Move files"))
+    }
+
     fn get_module(&self) -> String {
         String::from(MODULE)
     }
@@ -129,7 +140,14 @@ impl IsTask for MoveTask {
                 force,
             }),
             with: Arc::new(PreLogicInput::template(handle, request, tm, &self.with)?),
-            and: Arc::new(PostLogicInput::template(handle, request, tm, &self.and)?),
+            and: Arc::new(PostLogicInput::template(
+                handle,
+                request,
+                tm,
+                &self.and,
+                &self.retry,
+                &self.delay,
+            )?),
         })
     }
 }

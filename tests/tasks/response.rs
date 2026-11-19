@@ -1,14 +1,14 @@
 // Tests for TaskResponse
-use std::sync::Arc;
-use jetpack::tasks::response::{TaskResponse, TaskStatus};
-use jetpack::tasks::fields::Field;
 use jetpack::connection::command::CommandResult;
-use jetpack::tasks::logic::{PreLogicEvaluated, PostLogicEvaluated};
+use jetpack::tasks::fields::Field;
+use jetpack::tasks::response::{TaskResponse, TaskStatus};
+use std::sync::Arc;
 
 #[test]
 fn test_task_response_creation() {
     let response = TaskResponse {
         status: TaskStatus::IsCreated,
+        deferred: false,
         changes: Vec::new(),
         msg: Some("Test message".to_string()),
         command_result: Arc::new(None),
@@ -23,9 +23,10 @@ fn test_task_response_creation() {
 
 #[test]
 fn test_task_response_with_changes() {
-    let changes = vec![Field::new("test_field".to_string(), "test_value".to_string())];
+    let changes = vec![Field::Content];
     let response = TaskResponse {
         status: TaskStatus::IsModified,
+        deferred: false,
         changes,
         msg: None,
         command_result: Arc::new(None),
@@ -35,13 +36,14 @@ fn test_task_response_with_changes() {
 
     assert_eq!(response.status, TaskStatus::IsModified);
     assert_eq!(response.changes.len(), 1);
-    assert_eq!(response.changes[0].name, "test_field");
+    assert_eq!(response.changes[0], Field::Content);
 }
 
 #[test]
 fn test_task_response_failed() {
     let response = TaskResponse {
         status: TaskStatus::Failed,
+        deferred: false,
         changes: Vec::new(),
         msg: Some("Error occurred".to_string()),
         command_result: Arc::new(None),
@@ -75,6 +77,7 @@ fn test_task_status_variants() {
     for status in statuses {
         let response = TaskResponse {
             status,
+            deferred: false,
             changes: Vec::new(),
             msg: None,
             command_result: Arc::new(None),
@@ -89,13 +92,14 @@ fn test_task_status_variants() {
 #[test]
 fn test_task_response_with_command_result() {
     let command_result = CommandResult {
-        status: 0,
+        cmd: "echo success".to_string(),
+        rc: 0,
         out: "success".to_string(),
-        err: "".to_string(),
     };
-    
+
     let response = TaskResponse {
         status: TaskStatus::IsExecuted,
+        deferred: false,
         changes: Vec::new(),
         msg: None,
         command_result: Arc::new(Some(command_result)),
@@ -106,7 +110,7 @@ fn test_task_response_with_command_result() {
     assert_eq!(response.status, TaskStatus::IsExecuted);
     assert!(response.command_result.is_some());
     if let Some(ref cmd_result) = *response.command_result {
-        assert_eq!(cmd_result.status, 0);
+        assert_eq!(cmd_result.rc, 0);
         assert_eq!(cmd_result.out, "success");
     }
 }

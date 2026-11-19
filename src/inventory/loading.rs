@@ -29,6 +29,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+#[cfg(test)]
+mod blending_tests;
+
 // ==============================================================================================================
 // YAML SPEC
 // ==============================================================================================================
@@ -65,40 +68,60 @@ pub struct DynamicInventoryJsonEntry {
 pub fn load_inventory(
     inventory: &Arc<RwLock<Inventory>>,
     inventory_paths: Arc<RwLock<Vec<PathBuf>>>,
+    extra_vars: serde_yaml::Value,
 ) -> Result<(), String> {
     {
         let mut inv_obj = inventory.write().unwrap();
         inv_obj.store_group(&String::from("all"));
     }
 
+    // Assemble topology across every source before resolving declarations.
+    // Cache dynamic output so each executable runs once per load.
+    let mut sources = Vec::new();
     for inventory_path_buf in inventory_paths.read().unwrap().iter() {
         let inventory_path = inventory_path_buf.as_path();
         if inventory_path.is_dir() {
-            let groups_pathbuf = inventory_path_buf.join("groups");
-            let groups_path = groups_pathbuf.as_path();
-
-            if groups_path.exists() && groups_path.is_dir() {
-                load_on_disk_inventory_tree(inventory, true, inventory_path)?;
-            } else {
+            let has_groups = inventory_path.join("groups").is_dir();
+            let has_vars = inventory_path.join("group_vars").exists()
+                || inventory_path.join("host_vars").exists();
+            if !has_groups && !has_vars {
                 return Err(format!(
-                    "missing groups/ in --inventory path parameter ({})",
+                    "inventory path has no groups/, group_vars/, or host_vars/ ({})",
                     inventory_path.display()
                 ));
             }
+            if has_groups {
+                load_groups_directory(inventory, &inventory_path.join("groups"))?;
+            }
+            sources.push((inventory_path_buf.clone(), None));
+        } else if is_executable(inventory_path) {
+            let entries = read_dynamic_inventory(inventory_path)?;
+            apply_dynamic_inventory(inventory, &entries, false);
+            sources.push((inventory_path_buf.clone(), Some(entries)));
         } else {
-            if is_executable(inventory_path) {
-                load_dynamic_inventory(inventory, inventory_path)?;
-                let dirname = directory_as_string(inventory_path);
-                let dir = Path::new(&dirname);
-                load_on_disk_inventory_tree(inventory, false, dir)?;
-            } else {
-                return Err(format!(
-                    "non-directory path to --inventory ({}) is not executable",
-                    inventory_path.display()
-                ));
-            }
+            return Err(format!(
+                "non-directory path to --inventory ({}) is not executable",
+                inventory_path.display()
+            ));
         }
     }
+
+    // Preserve source order for variables, including dynamic declarations and
+    // the adjacent variable directories associated with executable sources.
+    for (path, dynamic_entries) in sources {
+        if let Some(entries) = dynamic_entries {
+            apply_dynamic_inventory(inventory, &entries, true);
+            let dirname = directory_as_string(&path);
+            load_on_disk_inventory_variables(inventory, Path::new(&dirname))?;
+        } else {
+            load_on_disk_inventory_variables(inventory, &path)?;
+        }
+    }
+
+    // Resolve provisioning after all declarations are loaded, without copying
+    // inherited variables into host-owned storage.
+    finalize_host_inventory(inventory, &extra_vars);
+
     Ok(())
 }
 
@@ -106,22 +129,34 @@ pub fn load_inventory(
 // PRIVATE INTERNALS
 // ==============================================================================================================
 
-// loads an entire on-disk inventory tree structure (groups/, group_vars/, host_vars/)
-fn load_on_disk_inventory_tree(
+/// Refresh inventory consumers after all sources are loaded. Inherited values
+/// remain on their declaring groups; they must never become host declarations.
+fn finalize_host_inventory(inventory: &Arc<RwLock<Inventory>>, extra_vars: &serde_yaml::Value) {
+    let hosts: Vec<_> = inventory.read().unwrap().hosts.values().cloned().collect();
+    for host in hosts {
+        let mut host = host.write().unwrap();
+        host.set_inventory_extra_vars(extra_vars.clone());
+        let resolved = host.get_inventory_variables();
+        let provision_key = serde_yaml::Value::String("provision".to_string());
+        if let Some(provision_value) = resolved.get(&provision_key)
+            && let Ok(config) = serde_yaml::from_value::<ProvisionConfig>(provision_value.clone())
+        {
+            host.set_provision(config);
+        }
+    }
+}
+
+// Load variable declarations after all sources have contributed topology.
+fn load_on_disk_inventory_variables(
     inventory: &Arc<RwLock<Inventory>>,
-    include_groups: bool,
     path: &Path,
 ) -> Result<(), String> {
     let path_buf = PathBuf::from(path);
     let group_vars_pathbuf = path_buf.join("group_vars");
     let host_vars_pathbuf = path_buf.join("host_vars");
-    let groups_path = path_buf.join("groups");
     let group_vars_path = group_vars_pathbuf.as_path();
     let host_vars_path = host_vars_pathbuf.as_path();
 
-    if include_groups {
-        load_groups_directory(inventory, &groups_path)?;
-    }
     if group_vars_path.exists() {
         load_vars_directory(inventory, group_vars_path, true)?;
     }
@@ -247,30 +282,13 @@ fn load_vars_directory(
             false => {
                 let host = inv.get_host(&effective_name);
 
-                // Start with existing host variables (from previous inventory paths)
+                // Merge only host declarations from previous inventory paths.
+                // Inherited group values are resolved separately, never stored
+                // here as if the host had declared them.
                 let mut merged_vars = {
                     let h = host.read().unwrap();
                     h.get_variables()
                 };
-
-                // Get all groups this host belongs to
-                let host_groups = {
-                    let h = host.read().unwrap();
-                    h.get_group_names()
-                };
-
-                // Merge group_vars in order (all group first, then more specific groups)
-                for group_name in &host_groups {
-                    if let Some(group_arc) = inv.groups.get(group_name) {
-                        let group = group_arc.read().unwrap();
-                        let group_vars = group.get_variables();
-
-                        // Merge group vars into merged_vars
-                        for (k, v) in group_vars.iter() {
-                            merged_vars.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
 
                 // Check for provision block and extract it specially
                 let provision_key = serde_yaml::Value::String("provision".to_string());
@@ -289,11 +307,13 @@ fn load_vars_directory(
                     }
                 }
 
-                // Merge host-specific vars, excluding the provision block
+                // Merge host-specific vars, INCLUDING the provision block. Keeping
+                // the raw (default-free) provision mapping here lets a group-level
+                // `provision` overlay deep-merge onto it during
+                // finalize_host_inventory; Host.provision is then re-derived
+                // from the resolved mapping so the provisioner sees the overlay.
                 for (k, v) in yaml_result.iter() {
-                    if k != &provision_key {
-                        merged_vars.insert(k.clone(), v.clone());
-                    }
+                    merged_vars.insert(k.clone(), v.clone());
                 }
 
                 // Set the merged variables on the host
@@ -305,10 +325,9 @@ fn load_vars_directory(
     Ok(())
 }
 
-// TODO: implement
-fn load_dynamic_inventory(inv: &Arc<RwLock<Inventory>>, path: &Path) -> Result<(), String> {
-    let mut inventory = inv.write().unwrap();
-
+fn read_dynamic_inventory(
+    path: &Path,
+) -> Result<HashMap<String, DynamicInventoryJsonEntry>, String> {
     let mut command = Command::new(format!("{}", path.display()));
     let output = match command.output() {
         Ok(x) => match x.status.code() {
@@ -342,7 +361,17 @@ fn load_dynamic_inventory(inv: &Arc<RwLock<Inventory>>, path: &Path) -> Result<(
         }
     };
 
-    for (possible_group_name, entry) in json_result.iter() {
+    Ok(json_result)
+}
+
+/// Apply topology first, then declarations in source order, from cached output.
+fn apply_dynamic_inventory(
+    inv: &Arc<RwLock<Inventory>>,
+    entries: &HashMap<String, DynamicInventoryJsonEntry>,
+    variables: bool,
+) {
+    let mut inventory = inv.write().unwrap();
+    for (possible_group_name, entry) in entries.iter() {
         let group_name = match possible_group_name.eq("_meta") {
             true => String::from("all"),
             false => possible_group_name.clone(),
@@ -351,37 +380,40 @@ fn load_dynamic_inventory(inv: &Arc<RwLock<Inventory>>, path: &Path) -> Result<(
             continue;
         }
 
-        inventory.store_group(&group_name);
+        if !variables {
+            inventory.store_group(&group_name);
+        }
         let group = inventory.get_group(&group_name);
 
         if let Some(hostvars) = &entry.hostvars {
             for (host_name, values) in hostvars.iter() {
-                inventory.store_host(&group_name, host_name);
-                let host = inventory.get_host(host_name);
-                let vars = convert_json_vars(values);
-                let mut hst = host.write().unwrap();
-                hst.update_variables(vars);
+                if variables {
+                    let host = inventory.get_host(host_name);
+                    host.write()
+                        .unwrap()
+                        .update_variables(convert_json_vars(values));
+                } else {
+                    inventory.store_host(&group_name, host_name);
+                }
             }
         }
-        if let Some(hosts) = &entry.hosts {
+        if !variables && let Some(hosts) = &entry.hosts {
             for host_name in hosts.iter() {
                 inventory.store_host(&group_name, host_name);
             }
         }
-        if entry.children.as_ref().is_some() {
+        if !variables && entry.children.as_ref().is_some() {
             let subgroups = entry.children.as_ref().unwrap();
             for subgroup_name in subgroups.iter() {
                 inventory.store_subgroup(&group_name, subgroup_name);
             }
         }
-        if entry.vars.as_ref().is_some() {
+        if variables && entry.vars.as_ref().is_some() {
             let mut grp = group.write().unwrap();
             let vars = convert_json_vars(&serde_json::Value::Object(entry.vars.clone().unwrap()));
             grp.update_variables(vars);
         }
     }
-
-    Ok(())
 }
 
 pub fn convert_json_vars(input: &serde_json::Value) -> serde_yaml::Mapping {
@@ -393,6 +425,31 @@ pub fn convert_json_vars(input: &serde_json::Value) -> serde_yaml::Mapping {
             "unable to load JSON back to YAML (1), this shouldn't happen: {}",
             y
         ),
+    }
+}
+
+/// Parse a `key=value` extra-vars string into a nested mapping, splitting the
+/// key on `.` so `provision.state=destroyed` → `{provision: {state: "destroyed"}}`.
+/// The value is taken as a string; use JSON (`-e '{"x":5}'`) for typed values.
+pub fn extra_vars_from_key_value(input: &str) -> Result<serde_yaml::Mapping, String> {
+    let (key, val) = input.split_once('=').ok_or_else(|| {
+        format!("--extra-vars: expected @file, inline JSON, or key=value; got {input:?}")
+    })?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(format!("--extra-vars: empty key in {input:?}"));
+    }
+    let val = val.trim();
+    // Build the nested mapping from the dotted key segments (leaf = the value).
+    let mut node: serde_yaml::Value = serde_yaml::Value::String(val.to_string());
+    for segment in key.split('.').rev() {
+        let mut mapping = serde_yaml::Mapping::new();
+        mapping.insert(serde_yaml::Value::String(segment.to_string()), node);
+        node = serde_yaml::Value::Mapping(mapping);
+    }
+    match node {
+        serde_yaml::Value::Mapping(m) => Ok(m),
+        _ => unreachable!("a non-empty dotted key always yields a mapping"),
     }
 }
 
@@ -425,7 +482,12 @@ mod tests {
         let (_keep_a, path_a) = inventory_tree_with_group_vars(first_yaml);
         let (_keep_b, path_b) = inventory_tree_with_group_vars(second_yaml);
         let paths = Arc::new(RwLock::new(vec![path_a, path_b]));
-        load_inventory(&inventory, paths).expect("load_inventory should succeed");
+        load_inventory(
+            &inventory,
+            paths,
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        )
+        .expect("load_inventory should succeed");
         inventory
             .read()
             .unwrap()
@@ -451,5 +513,298 @@ mod tests {
         assert_eq!(vars["token"], "s3cr3t");
         // On conflict, the later path wins.
         assert_eq!(vars["shared"], "from-second");
+    }
+
+    // Build an inventory tree with a named group (+ optional members), optional
+    // group_vars for that group, and optional host_vars. The groups/ dir is
+    // always created (load_inventory requires it); the group-members file is
+    // written only when `members` is non-empty so a path can carry group_vars
+    // with an empty groups/ (the secrets-overlay shape).
+    fn inventory_tree_with_host(
+        group: &str,
+        members: &[&str],
+        group_vars_yaml: Option<&str>,
+        host_vars: &[(&str, &str)],
+    ) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let groups_dir = root.join("groups");
+        fs::create_dir_all(&groups_dir).unwrap();
+        if !members.is_empty() {
+            let mut body = String::from("hosts:\n");
+            for m in members {
+                body.push_str(&format!("  - {}\n", m));
+            }
+            fs::write(groups_dir.join(group), body).unwrap();
+        }
+        if let Some(yaml) = group_vars_yaml {
+            let gv = root.join("group_vars");
+            fs::create_dir_all(&gv).unwrap();
+            fs::write(gv.join(group), yaml).unwrap();
+        }
+        if !host_vars.is_empty() {
+            let hv = root.join("host_vars");
+            fs::create_dir_all(&hv).unwrap();
+            for (host, yaml) in host_vars {
+                fs::write(hv.join(host), yaml).unwrap();
+            }
+        }
+        let path = root.to_path_buf();
+        (dir, path)
+    }
+
+    // Regression for the london k3s DNS no-op: group_vars contributed by a later
+    // --inventory path (a secrets overlay) must reach a member host's resolved
+    // variables — not just sit on the group object. The host's host_vars live in
+    // the first (public) path; a `dns:` block lives only in the second (secrets)
+    // path's group_vars (and that path has no host_vars to trigger propagation).
+    // After loading both, the host's variables must contain the dns block, or the
+    // DNS reconciliation (which reads host variables) silently never fires.
+    #[test]
+    fn group_vars_from_later_inventory_path_reach_host_variables() {
+        let (_keep_pub, pub_path) = inventory_tree_with_host(
+            "webservers",
+            &["web1"],
+            Some("public_key: from-public\n"),
+            &[("web1", "host_key: from-host\n")],
+        );
+        let (_keep_sec, sec_path) = inventory_tree_with_host(
+            "webservers",
+            &[],
+            Some("dns:\n  path: dns/riff.cc\n  zone: lon.riff.cc\n  source_of_truth: inventory\n"),
+            &[],
+        );
+
+        let inventory = Arc::new(RwLock::new(Inventory::new()));
+        let paths = Arc::new(RwLock::new(vec![pub_path, sec_path]));
+        load_inventory(
+            &inventory,
+            paths,
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        )
+        .expect("load_inventory should succeed");
+
+        let host_vars = inventory
+            .read()
+            .unwrap()
+            .get_host("web1")
+            .read()
+            .unwrap()
+            .get_inventory_variables();
+
+        // Public group var propagated via the path-1 host_vars load.
+        assert_eq!(host_vars["public_key"], "from-public");
+        // Host-specific var present.
+        assert_eq!(host_vars["host_key"], "from-host");
+        // THE REGRESSION: the secrets-overlay group var must reach the host.
+        let dns_key = serde_yaml::Value::String("dns".to_string());
+        assert!(
+            host_vars.get(&dns_key).is_some(),
+            "dns block from secrets group_vars must propagate to host variables; got: {:?}",
+            host_vars
+        );
+    }
+
+    // Group-level `provision` overlay: a field set in a group's group_vars (e.g.
+    // `state: destroyed`) must merge onto each member host's host_vars provision
+    // config, so the whole fleet's lifecycle state can be toggled from one file
+    // (the PXE-starvation harness resets/recreates test-k8s this way). Host_vars
+    // fields are preserved.
+    #[test]
+    fn group_provision_overlay_merges_onto_host_provision_config() {
+        let (_keep, path) = inventory_tree_with_host(
+            "testgroup",
+            &["testhost"],
+            Some("provision:\n  state: destroyed\n"),
+            &[(
+                "testhost",
+                "provision:\n  type: proxmox_vm\n  cluster: space\n",
+            )],
+        );
+
+        let inventory = Arc::new(RwLock::new(Inventory::new()));
+        let paths = Arc::new(RwLock::new(vec![path]));
+        load_inventory(
+            &inventory,
+            paths,
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        )
+        .expect("load_inventory should succeed");
+
+        let provision = inventory
+            .read()
+            .unwrap()
+            .get_host("testhost")
+            .read()
+            .unwrap()
+            .get_provision()
+            .expect("host has a provision config")
+            .clone();
+
+        assert_eq!(
+            provision.state, "destroyed",
+            "group provision.state must overlay onto the host config"
+        );
+        assert_eq!(provision.provision_type, "proxmox_vm");
+        assert_eq!(provision.cluster, "space");
+    }
+
+    // Precedence: when both the group and the host set the same provision field,
+    // the host's value wins (matches variable resolution — more specific wins).
+    #[test]
+    fn host_provision_field_wins_over_group_overlay() {
+        let (_keep, path) = inventory_tree_with_host(
+            "testgroup",
+            &["testhost"],
+            Some("provision:\n  state: destroyed\n"),
+            &[(
+                "testhost",
+                "provision:\n  type: proxmox_vm\n  cluster: space\n  state: present\n",
+            )],
+        );
+
+        let inventory = Arc::new(RwLock::new(Inventory::new()));
+        let paths = Arc::new(RwLock::new(vec![path]));
+        load_inventory(
+            &inventory,
+            paths,
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        )
+        .expect("load_inventory should succeed");
+
+        let provision = inventory
+            .read()
+            .unwrap()
+            .get_host("testhost")
+            .read()
+            .unwrap()
+            .get_provision()
+            .expect("host has a provision config")
+            .clone();
+
+        assert_eq!(
+            provision.state, "present",
+            "host_vars state wins over group"
+        );
+    }
+
+    // -e / --extra-vars reach the provisioner: a `provision` field injected via
+    // extra_vars merges onto each host's provision config at the highest
+    // precedence, so `jetpack apply -e provision.state=destroyed` drives a
+    // fleet's lifecycle without touching inventory files. Beats host_vars.
+    #[test]
+    fn extra_vars_provision_overlay_reaches_host_provision() {
+        let (_keep, path) = inventory_tree_with_host(
+            "testgroup",
+            &["testhost"],
+            None,
+            &[(
+                "testhost",
+                "provision:\n  type: proxmox_vm\n  cluster: space\n  state: present\n",
+            )],
+        );
+        let extra: serde_yaml::Value =
+            serde_yaml::from_str("provision:\n  state: destroyed\n").unwrap();
+
+        let inventory = Arc::new(RwLock::new(Inventory::new()));
+        let paths = Arc::new(RwLock::new(vec![path]));
+        load_inventory(&inventory, paths, extra).expect("load_inventory should succeed");
+
+        let provision = inventory
+            .read()
+            .unwrap()
+            .get_host("testhost")
+            .read()
+            .unwrap()
+            .get_provision()
+            .expect("host has a provision config")
+            .clone();
+
+        // extra_vars (highest precedence) beats host_vars state:present.
+        assert_eq!(provision.state, "destroyed");
+        assert_eq!(provision.provision_type, "proxmox_vm");
+    }
+
+    #[test]
+    fn extra_vars_key_value_dotted_nests() {
+        let m = extra_vars_from_key_value("provision.state=destroyed").unwrap();
+        let s = serde_yaml::to_string(&m).unwrap();
+        assert!(s.contains("provision:"), "{s}");
+        assert!(s.contains("state: destroyed"), "{s}");
+    }
+
+    #[test]
+    fn extra_vars_key_value_keeps_equals_in_value() {
+        let m = extra_vars_from_key_value("token=a=b=c").unwrap();
+        let s = serde_yaml::to_string(&m).unwrap();
+        assert!(s.contains("token: a=b=c"), "{s}");
+    }
+
+    #[test]
+    fn extra_vars_key_value_rejects_malformed() {
+        // no '=', empty key, whitespace-only key
+        assert!(extra_vars_from_key_value("nokeyvalue").is_err());
+        assert!(extra_vars_from_key_value("=value").is_err());
+        assert!(extra_vars_from_key_value("   =val").is_err());
+    }
+
+    // A directory with group_vars/ but no groups/ is a vars-only overlay — the
+    // `secrets_inventory` shape — and must load in the same pass as the main
+    // inventory (single propagate) so it layers with later-wins on conflicts.
+    #[test]
+    fn vars_only_inventory_path_overlays_without_groups_dir() {
+        let (_keep_main, main_path) = inventory_tree_with_host(
+            "webservers",
+            &["web1"],
+            Some("public: from-main\nshared: from-main\n"),
+            &[("web1", "host_key: from-host\n")],
+        );
+
+        // Overlay path: group_vars only, NO groups/ dir at all.
+        let sec_dir = TempDir::new().unwrap();
+        let sec_gv = sec_dir.path().join("group_vars");
+        fs::create_dir_all(&sec_gv).unwrap();
+        fs::write(
+            sec_gv.join("webservers"),
+            "secret_token: s3cr3t\nshared: from-secrets\n",
+        )
+        .unwrap();
+
+        let inventory = Arc::new(RwLock::new(Inventory::new()));
+        load_inventory(
+            &inventory,
+            Arc::new(RwLock::new(vec![main_path, sec_dir.path().to_path_buf()])),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        )
+        .expect("combined main + overlay load succeeds");
+
+        let host_vars = inventory
+            .read()
+            .unwrap()
+            .get_host("web1")
+            .read()
+            .unwrap()
+            .get_inventory_variables();
+        assert_eq!(host_vars["public"], "from-main"); // main var survives
+        assert_eq!(host_vars["secret_token"], "s3cr3t"); // overlay var reaches host
+        assert_eq!(host_vars["shared"], "from-secrets"); // overlay wins on conflict
+    }
+
+    #[test]
+    fn inventory_path_with_no_content_errors() {
+        // A directory with none of groups/, group_vars/, host_vars/ is not a
+        // usable inventory — error clearly rather than silently loading nothing.
+        let empty = TempDir::new().unwrap();
+        let inventory = Arc::new(RwLock::new(Inventory::new()));
+        let err = load_inventory(
+            &inventory,
+            Arc::new(RwLock::new(vec![empty.path().to_path_buf()])),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("no groups/") && err.contains("group_vars"),
+            "{err}"
+        );
     }
 }

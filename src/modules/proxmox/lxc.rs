@@ -25,6 +25,7 @@ const MODULE: &str = "proxmox_lxc";
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct ProxmoxLxcTask {
     pub name: Option<String>,
     pub api_host: String,
@@ -44,6 +45,8 @@ pub struct ProxmoxLxcTask {
     pub start_on_create: Option<String>,
     pub state: Option<String>,
     pub with: Option<PreLogicInput>,
+    pub retry: Option<String>,
+    pub delay: Option<String>,
     pub and: Option<PostLogicInput>,
 }
 
@@ -185,7 +188,14 @@ impl IsTask for ProxmoxLxcTask {
                     .unwrap_or_else(|| String::from("present")),
             }),
             with: Arc::new(PreLogicInput::template(handle, request, tm, &self.with)?),
-            and: Arc::new(PostLogicInput::template(handle, request, tm, &self.and)?),
+            and: Arc::new(PostLogicInput::template(
+                handle,
+                request,
+                tm,
+                &self.and,
+                &self.retry,
+                &self.delay,
+            )?),
         })
     }
 }
@@ -259,7 +269,7 @@ impl ProxmoxLxcAction {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| {
                     handle
@@ -324,7 +334,7 @@ impl ProxmoxLxcAction {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| {
                     handle
@@ -411,7 +421,7 @@ impl ProxmoxLxcAction {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| {
                     handle
@@ -464,7 +474,7 @@ impl ProxmoxLxcAction {
 
         rt.block_on(async {
             let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .tls_danger_accept_invalid_certs(true)
                 .build()
                 .map_err(|e| {
                     handle

@@ -24,6 +24,7 @@ const MODULE: &str = "self_locate";
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct SelfLocateTask {
     pub name: Option<String>,
 
@@ -42,6 +43,8 @@ pub struct SelfLocateTask {
     #[serde(default)]
     pub with: Option<PreLogicInput>,
 
+    pub retry: Option<String>,
+    pub delay: Option<String>,
     #[serde(default, rename = "and")]
     pub and: Option<PostLogicInput>,
 }
@@ -60,6 +63,14 @@ struct SelfLocateAction {
 }
 
 impl IsTask for SelfLocateTask {
+    fn name_variable_writes(&self) -> crate::tasks::naming::NameVariableWrites {
+        crate::tasks::naming::NameVariableWrites::saved(Some(&self.save))
+    }
+
+    fn generated_name(&self, _context: &crate::tasks::naming::NamingContext<'_>) -> Option<String> {
+        Some("Locate execution host".into())
+    }
+
     fn get_module(&self) -> String {
         String::from(MODULE)
     }
@@ -104,7 +115,14 @@ impl IsTask for SelfLocateTask {
                 )?,
             }),
             with: Arc::new(PreLogicInput::template(handle, request, tm, &self.with)?),
-            and: Arc::new(PostLogicInput::template(handle, request, tm, &self.and)?),
+            and: Arc::new(PostLogicInput::template(
+                handle,
+                request,
+                tm,
+                &self.and,
+                &self.retry,
+                &self.delay,
+            )?),
         })
     }
 }
@@ -266,6 +284,9 @@ mod tests {
     #[test]
     fn test_self_locate_task_basic() {
         let task = SelfLocateTask {
+            delay: None,
+            retry: None,
+
             name: Some("Detect location".to_string()),
             save: "location".to_string(),
             api_host: None,
@@ -283,6 +304,9 @@ mod tests {
     #[test]
     fn test_self_locate_task_with_api() {
         let task = SelfLocateTask {
+            delay: None,
+            retry: None,
+
             name: None,
             save: "loc".to_string(),
             api_host: Some("https://pve.local:8006".to_string()),

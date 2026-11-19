@@ -28,7 +28,7 @@ use guid_create::GUID;
 use std::collections::HashMap;
 use std::env;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 // the playbook traversal state, and a little bit more than that.
@@ -50,6 +50,8 @@ pub struct PlaybookContext {
 
     pub task_count: usize,
     pub task: Option<String>,
+    /// Display-only snapshot for multi-batch plays; never used for execution.
+    pub naming_variables: Option<serde_yaml::Mapping>,
 
     seen_hosts: HashMap<String, Arc<RwLock<Host>>>,
     targetted_hosts: HashMap<String, Arc<RwLock<Host>>>,
@@ -64,6 +66,8 @@ pub struct PlaybookContext {
     passive_count_for_host: HashMap<String, usize>,
     matched_count_for_host: HashMap<String, usize>,
     skipped_count_for_host: HashMap<String, usize>,
+    deferred_count_for_host: HashMap<String, usize>,
+    deferred_only_count_for_host: HashMap<String, usize>,
     failed_count_for_host: HashMap<String, usize>,
 
     // TODO: some of these don't need to be pub.
@@ -78,9 +82,15 @@ pub struct PlaybookContext {
     pub templar: RwLock<Templar>,
 
     pub ssh_user: String,
+    ssh_user_explicit: bool,
+    ssh_port_explicit: bool,
     pub ssh_port: i64,
     pub sudo: Option<String>,
     extra_vars: serde_yaml::Value,
+    /// Automation-repository root, copied from the parser. Generators (DNS
+    /// today) anchor their output paths here so a playbook run from a
+    /// subdirectory writes under the repo root, not the playbook dir.
+    pub automation_root: PathBuf,
 }
 
 impl PlaybookContext {
@@ -93,6 +103,7 @@ impl PlaybookContext {
             play: None,
             role: None,
             task: None,
+            naming_variables: None,
             play_count: 0,
             play_index: 0,
             role_count: 0,
@@ -111,6 +122,8 @@ impl PlaybookContext {
             matched_count_for_host: HashMap::new(),
             failed_count_for_host: HashMap::new(),
             skipped_count_for_host: HashMap::new(),
+            deferred_count_for_host: HashMap::new(),
+            deferred_only_count_for_host: HashMap::new(),
             connection_cache: RwLock::new(ConnectionCache::new()),
             templar: RwLock::new(Templar::new()),
             defaults_storage: RwLock::new(serde_yaml::Mapping::new()),
@@ -119,9 +132,15 @@ impl PlaybookContext {
             role_defaults_storage: RwLock::new(serde_yaml::Mapping::new()),
             env_storage: RwLock::new(serde_yaml::Mapping::new()),
             ssh_user: parser.default_user.clone(),
+            ssh_user_explicit: parser.user_set || env::var("JET_SSH_USER").is_ok(),
+            ssh_port_explicit: parser.port_set
+                || env::var("JET_SSH_PORT")
+                    .ok()
+                    .is_some_and(|v| v.parse::<u16>().is_ok_and(|p| p != 0)),
             ssh_port: parser.default_port,
             sudo: parser.sudo.clone(),
             extra_vars: parser.extra_vars.clone(),
+            automation_root: parser.automation_root.clone(),
         };
         s.load_environment();
         s
@@ -144,10 +163,12 @@ impl PlaybookContext {
 
     pub fn set_ssh_user(&mut self, ssh_user: &str) {
         self.ssh_user = ssh_user.to_string();
+        self.ssh_user_explicit = true;
     }
 
     pub fn set_ssh_port(&mut self, ssh_port: i64) {
         self.ssh_port = ssh_port;
+        self.ssh_port_explicit = true;
     }
 
     // used in traversal to tell the context what the current set of possible
@@ -181,6 +202,17 @@ impl PlaybookContext {
         self.failed_hosts.insert(hostname.clone(), Arc::clone(host));
     }
 
+    // A host destroyed by its provisioner is removed from the task pool for the
+    // rest of the play. Unlike fail_host this is an intentional lifecycle
+    // outcome, not a task failure: it does not count against failed_tasks and
+    // is not recorded as a failed host, so a play that destroys all of its
+    // hosts can complete successfully instead of erroring "no hosts remaining".
+
+    pub fn destroy_host(&mut self, host: &Arc<RwLock<Host>>) {
+        let hostname = host.read().unwrap().name.clone();
+        self.targetted_hosts.remove(&hostname);
+    }
+
     pub fn set_playbook_path(&mut self, path: &Path) {
         self.playbook_path = Some(path_as_string(path));
         self.playbook_directory = Some(directory_as_string(path));
@@ -192,6 +224,7 @@ impl PlaybookContext {
 
     pub fn set_play(&mut self, play: &Play) {
         self.play = Some(play.name.clone());
+        self.naming_variables = None;
         self.play_count += 1;
     }
 
@@ -249,7 +282,7 @@ impl PlaybookContext {
         let src1ar = src1r.deref();
         blend_variables(&mut blended, serde_yaml::Value::Mapping(src1ar.clone()));
 
-        let src2 = host.read().unwrap().get_blended_variables();
+        let src2 = host.read().unwrap().get_template_variables();
         blend_variables(&mut blended, serde_yaml::Value::Mapping(src2));
 
         let src3 = self.vars_storage.read().unwrap();
@@ -287,8 +320,31 @@ impl PlaybookContext {
                 serde_yaml::Value::String("jet_play_hosts".to_string()),
                 serde_yaml::Value::Sequence(hosts_seq),
             );
+            super::plan_dependencies::annotate(mapping, &host.read().unwrap().plan_unavailable);
         }
 
+        blended
+    }
+
+    /// Hostless variable blend for resolving play-level fields (notably
+    /// `play.groups`, see #52) *before* any host is targeted. Mirrors the
+    /// precedence of `get_complete_blended_variables_as_value` but omits the
+    /// host slice (no host selected yet — groups select hosts) and the role
+    /// slices (roles are processed after targeting): `defaults_storage` →
+    /// `vars_storage` → `extra_vars` (highest).
+    pub fn hostless_play_vars(&self) -> serde_yaml::Value {
+        let mut blended = serde_yaml::Value::from(serde_yaml::Mapping::new());
+        let src1 = self.defaults_storage.read().unwrap();
+        blend_variables(
+            &mut blended,
+            serde_yaml::Value::Mapping(src1.deref().clone()),
+        );
+        let src2 = self.vars_storage.read().unwrap();
+        blend_variables(
+            &mut blended,
+            serde_yaml::Value::Mapping(src2.deref().clone()),
+        );
+        blend_variables(&mut blended, self.extra_vars.clone());
         blended
     }
 
@@ -334,7 +390,16 @@ impl PlaybookContext {
     ) -> Result<bool, String> {
         let mut vars =
             self.get_complete_blended_variables_as_value(host, BlendTarget::NotTemplateModule);
+        let overrides: Vec<_> = vars_input
+            .keys()
+            .filter_map(|k| k.as_str().map(str::to_owned))
+            .collect();
         blend_variables(&mut vars, serde_yaml::Value::Mapping(vars_input));
+        if let serde_yaml::Value::Mapping(data) = &mut vars {
+            for key in overrides {
+                super::plan_dependencies::clear(data, &key);
+            }
+        }
         match vars {
             serde_yaml::Value::Mapping(x) => {
                 self.templar.read().unwrap().test_condition(expr, x, tm)
@@ -349,6 +414,15 @@ impl PlaybookContext {
     // already on the context or check some variables in inventory.
 
     // FIXME: this should return a struct
+
+    /// Explicit Jetpack connection settings override SSH config; implicit defaults do not.
+    pub(crate) fn ssh_connection_overrides(&self, host: &Arc<RwLock<Host>>) -> (bool, bool) {
+        let vars = self.get_complete_blended_variables(host, BlendTarget::NotTemplateModule);
+        (
+            self.ssh_user_explicit || vars.get("jet_ssh_user").and_then(|v| v.as_str()).is_some(),
+            self.ssh_port_explicit || vars.get("jet_ssh_port").is_some(),
+        )
+    }
 
     pub fn get_ssh_connection_details(
         &self,
@@ -567,6 +641,35 @@ impl PlaybookContext {
             .skipped_count_for_host
             .entry(host.to_string())
             .or_insert(0) += 1;
+    }
+
+    pub fn increment_deferred_for_host(&mut self, host: &str, only: bool) {
+        *self.deferred_count_for_host.entry(host.into()).or_default() += 1;
+        if only {
+            *self
+                .deferred_only_count_for_host
+                .entry(host.into())
+                .or_default() += 1;
+        }
+    }
+    pub fn get_total_deferred_count(&self) -> usize {
+        self.deferred_count_for_host.values().sum()
+    }
+    pub fn get_hosts_deferred_count(&self) -> usize {
+        self.deferred_count_for_host.len()
+    }
+    pub fn get_total_deferred_only_count(&self) -> usize {
+        self.deferred_only_count_for_host.values().sum()
+    }
+    pub fn get_hosts_unchanged_count(&self) -> usize {
+        self.seen_hosts
+            .keys()
+            .filter(|host| {
+                !self.adjusted_count_for_host.contains_key(*host)
+                    && !self.deferred_count_for_host.contains_key(*host)
+                    && !self.failed_count_for_host.contains_key(*host)
+            })
+            .count()
     }
 
     pub fn get_total_attempted_count(&self) -> usize {

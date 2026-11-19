@@ -80,6 +80,7 @@ const MODULE: &str = "instantiate";
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct InstantiateTask {
     pub name: Option<String>,
 
@@ -118,10 +119,12 @@ pub struct InstantiateTask {
     pub save: Option<String>,
 
     pub with: Option<PreLogicInput>,
+    pub retry: Option<String>,
+    pub delay: Option<String>,
     pub and: Option<PostLogicInput>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct ProvisionTemplate {
     #[serde(rename = "type")]
     pub provision_type: String,
@@ -295,7 +298,14 @@ impl IsTask for InstantiateTask {
                 state,
             }),
             with: Arc::new(PreLogicInput::template(handle, request, tm, &self.with)?),
-            and: Arc::new(PostLogicInput::template(handle, request, tm, &self.and)?),
+            and: Arc::new(PostLogicInput::template(
+                handle,
+                request,
+                tm,
+                &self.and,
+                &self.retry,
+                &self.delay,
+            )?),
         })
     }
 }

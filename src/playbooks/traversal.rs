@@ -21,8 +21,15 @@ use crate::playbooks::async_exec::AsyncExecutionContext;
 use crate::playbooks::async_ui::{AsyncUi, HostEvent, TaskDisplayStatus};
 use crate::playbooks::context::PlaybookContext;
 use crate::playbooks::language::Play;
-use crate::playbooks::language::{InstantiateSpec, Role, RoleInvocation};
+use crate::playbooks::language::{InstantiateSpec, RoleInvocation};
+use crate::playbooks::provision_phase::{
+    apply_provision_outcomes, format_provision_summary, provision_host_with,
+};
+use crate::playbooks::role_tree::{
+    RoleSection, RoleWalkState, resolve_role_file, resolve_template_src, walk_role_tree,
+};
 use crate::playbooks::task_fsm::{async_run_single_task, fsm_run_task};
+use crate::playbooks::templar::TemplateMode;
 use crate::playbooks::visitor::PlaybookVisitor;
 use crate::provisioners::{ProvisionConfig, ensure_host_provisioned};
 use crate::registry::list::Task;
@@ -76,6 +83,49 @@ pub struct RunState {
     pub role_processing_stack: Arc<RwLock<Vec<String>>>,
     // Files fetched by !fetch tasks (remote_path → bytes)
     pub fetched_files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+// RunState backs the shared role walk with its existing per-section "processed"
+// sets and cycle stack, so `walk_role_tree` drives execution exactly as the old
+// hand-written `process_role` walk did.
+impl RoleWalkState for RunState {
+    fn is_processed(&self, role: &str, section: RoleSection) -> bool {
+        let set = match section {
+            RoleSection::Tasks => self.processed_role_tasks.read().unwrap(),
+            RoleSection::Handlers => self.processed_role_handlers.read().unwrap(),
+        };
+        set.contains(role)
+    }
+
+    fn mark_processed(&self, role: &str, section: RoleSection) {
+        let mut set = match section {
+            RoleSection::Tasks => self.processed_role_tasks.write().unwrap(),
+            RoleSection::Handlers => self.processed_role_handlers.write().unwrap(),
+        };
+        set.insert(role.to_string());
+    }
+
+    fn in_stack(&self, role: &str) -> bool {
+        self.role_processing_stack
+            .read()
+            .unwrap()
+            .contains(&role.to_string())
+    }
+
+    fn push_stack(&self, role: &str) {
+        self.role_processing_stack
+            .write()
+            .unwrap()
+            .push(role.to_string());
+    }
+
+    fn pop_stack(&self) {
+        self.role_processing_stack.write().unwrap().pop();
+    }
+
+    fn stack_snapshot(&self) -> Vec<String> {
+        self.role_processing_stack.read().unwrap().clone()
+    }
 }
 
 // this is the top end traversal function that is called from cli/playbooks.rs
@@ -271,20 +321,56 @@ fn handle_play(run_state: &Arc<RunState>, play: &Play) -> Result<(), String> {
         handle_instantiate(run_state, play, spec)?;
     }
 
+    // Load the play's vars/vars_files/defaults into the context BEFORE resolving
+    // groups so `play.groups` can template against them (#52). Safe to hoist:
+    // nothing between here and the former call site reads play-var storage, and
+    // load_vars overwrites-per-play so there is no cross-play leak.
+    load_vars_into_context(run_state, play)?;
+
     // make sure all host and groups used to limit exists
     validate_limit_groups(run_state, play)?;
     validate_limit_hosts(run_state, play)?;
 
+    // Resolve the concrete groups this play targets (templated + CLI-override +
+    // pull-mode handling), then validate and fan out from that resolved list.
+    let target_groups = resolve_target_groups(run_state, play)?;
+
     // make sure all hosts are valid and we have some hosts to talk to
-    validate_groups(run_state, play)?;
-    let hosts = get_play_hosts(run_state, play);
+    validate_groups(run_state, &target_groups)?;
+    let hosts = get_play_hosts(run_state, &target_groups);
     validate_hosts(run_state, play, &hosts)?;
-    load_vars_into_context(run_state, play)?;
 
     // support for serialization if using push configuration
     // means we may not configure hosts all at once but may take
     // several passes to do a smaller number of them
     let (_batch_size, batch_count, batches) = get_host_batches(run_state, play, hosts);
+
+    if batch_count > 1 {
+        // One declaration must not acquire a different label just because
+        // heterogeneous hosts were split into smaller execution batches.
+        let all_hosts: Vec<_> = batches
+            .values()
+            .flat_map(|batch| batch.iter().cloned())
+            .collect();
+        let mut variables = task_name_variables(run_state, &all_hosts);
+        // This magic variable describes the execution batch, not a resource
+        // set known to be identical across every batch of the play.
+        variables.remove(serde_yaml::Value::String("jet_play_hosts".into()));
+        // Role files are loaded only during execution. Do not load them a
+        // second time just for labels or assume their outputs are read-only.
+        if play.roles.as_ref().is_some_and(|roles| !roles.is_empty()) {
+            variables.clear();
+        }
+        for task in play
+            .tasks
+            .iter()
+            .flatten()
+            .chain(play.handlers.iter().flatten())
+        {
+            task.forget_name_variables(&mut variables);
+        }
+        run_state.context.write().unwrap().naming_variables = Some(variables);
+    }
 
     let mut failed: bool = false;
     let mut failure_message: String = String::new();
@@ -384,11 +470,7 @@ fn syntax_validate_task(task: &Task) -> Result<(), String> {
     if let Task::Template(template_task) = task {
         let cwd =
             env::current_dir().map_err(|e| format!("could not determine role directory: {}", e))?;
-        let candidates = [
-            cwd.join(&template_task.src),
-            cwd.join("templates").join(&template_task.src),
-        ];
-        let src_path = candidates.iter().find(|p| p.is_file()).ok_or_else(|| {
+        let src_path = resolve_template_src(&cwd, &template_task.src).ok_or_else(|| {
             format!(
                 "template source '{}' not found in role root or templates/",
                 template_task.src
@@ -431,16 +513,17 @@ fn handle_batch(
             let host = host_arc.read().unwrap();
             (
                 host.name.clone(),
-                host.get_variables(),
+                host.get_inventory_variables(),
                 host.get_provision().cloned(),
             )
         };
 
         // Parse dns config from host variables
         let dns_key = serde_yaml::Value::String("dns".to_string());
+        let automation_root = run_state.context.read().unwrap().automation_root.clone();
         if let Some(dns_config) = host_vars
             .get(&dns_key)
-            .and_then(|v| serde_yaml::from_value::<crate::dns::DnsConfig>(v.clone()).ok())
+            .and_then(|v| crate::dns::dns_config_from_vars(v, &automation_root))
         {
             // Look up IP from zone file
             if let Ok(Some(zone_ip)) = dns_config.lookup_ip(&host_name) {
@@ -449,7 +532,8 @@ fn handle_batch(
                     let mut host = host_arc.write().unwrap();
                     let mut vars = host.get_variables();
                     let key = serde_yaml::Value::String("jet_ssh_hostname".to_string());
-                    let current_ip = vars
+                    let current_ip = host
+                        .get_inventory_variables()
                         .get(&key)
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
@@ -538,91 +622,45 @@ fn handle_batch(
         return async_handle_batch(run_state, play, hosts);
     }
 
-    // Sequential mode: provision all hosts before running tasks
-    for host_arc in hosts.iter() {
-        let (host_name, needs_provision, provision_config, host_vars) = {
-            let host = host_arc.read().unwrap();
-            (
-                host.name.clone(),
-                host.needs_provisioning(),
-                host.get_provision().cloned(),
-                host.get_variables(),
-            )
-        };
+    // Provision all hosts in parallel via the shared seam, then run the
+    // task-parallel phase against the survivors. Parallelizing provision means
+    // N hosts image concurrently — each gated on its own SSH readiness — instead
+    // of serially. The DNS write lock and the VMID lock make the concurrent
+    // infrastructure writes safe.
+    use rayon::prelude::*;
+    use std::time::Instant;
+    let phase_start = Instant::now();
+    let timed: Vec<_> = hosts
+        .par_iter()
+        .map(|host| {
+            let start = Instant::now();
+            let outcome = provision_host_with(run_state, host, ensure_host_provisioned);
+            (outcome, start.elapsed())
+        })
+        .collect();
+    let outcomes: Vec<_> = timed.iter().map(|(o, _)| o.clone()).collect();
 
-        if needs_provision && let Some(ref config) = provision_config {
-            // Dry-run: never create/update/destroy infrastructure in check mode.
-            if check_mode {
-                eprintln!(
-                    "  ~ {} => would provision ({}) — skipped (check mode)",
-                    host_name, config.provision_type
-                );
-                continue;
-            }
-            let dns_key = serde_yaml::Value::String("dns".to_string());
-            let dns_config = host_vars
-                .get(&dns_key)
-                .and_then(|v| serde_yaml::from_value::<crate::dns::DnsConfig>(v.clone()).ok());
+    // Exclude destroyed hosts from the task pool; abort on any provision failure.
+    let destroyed = apply_provision_outcomes(&run_state.context, hosts, &outcomes)?;
 
-            match ensure_host_provisioned(
-                config,
-                &host_name,
-                &run_state.inventory,
-                dns_config.as_ref(),
-                run_state.output_handler.as_ref(),
-            ) {
-                Ok(crate::provisioners::ProvisionResult::Destroyed) => {
-                    run_state.visitor.read().unwrap().on_host_provisioned(
-                        &run_state.context,
-                        &host_name,
-                        &crate::provisioners::ProvisionResult::Destroyed,
-                    );
-                    continue;
-                }
-                Ok(result) => {
-                    run_state.visitor.read().unwrap().on_host_provisioned(
-                        &run_state.context,
-                        &host_name,
-                        &result,
-                    );
+    // Controller-plane telemetry: per-host provision timing with the straggler flagged.
+    eprint!(
+        "{}",
+        format_provision_summary(hosts, &timed, phase_start.elapsed())
+    );
 
-                    let ip = crate::provisioners::get_provisioner(&config.provision_type)
-                        .ok()
-                        .and_then(|p| {
-                            p.get_ip(config, &host_name, &run_state.inventory)
-                                .ok()
-                                .flatten()
-                        });
-
-                    let mut host = host_arc.write().unwrap();
-                    let mut vars = host.get_variables();
-                    let mut changed = false;
-
-                    if let Some(ref ip_addr) = ip {
-                        let key = serde_yaml::Value::String("jet_ssh_hostname".to_string());
-                        if !vars.contains_key(&key) {
-                            vars.insert(key, serde_yaml::Value::String(ip_addr.clone()));
-                            changed = true;
-                        }
-                    }
-
-                    if let Some(ref ssh_user) = config.ssh_user {
-                        let key = serde_yaml::Value::String("jet_ssh_user".to_string());
-                        if !vars.contains_key(&key) {
-                            vars.insert(key, serde_yaml::Value::String(ssh_user.clone()));
-                            changed = true;
-                        }
-                    }
-
-                    if changed {
-                        host.set_variables(vars);
-                    }
-                }
-                Err(e) => {
-                    return Err(format!("Failed to provision host '{}': {}", host_name, e));
-                }
-            }
-        }
+    // A play that intentionally destroyed every host has nothing left to
+    // configure — succeed without running tasks. (A genuinely empty play still
+    // falls through to the task phase, preserving the prior behavior.)
+    if destroyed > 0
+        && run_state
+            .context
+            .read()
+            .unwrap()
+            .get_remaining_hosts()
+            .is_empty()
+    {
+        return Ok(());
     }
 
     // Default mode: task-parallel execution (all hosts per task, then next task)
@@ -693,6 +731,18 @@ fn async_handle_batch(
         return Ok(());
     }
 
+    // Freeze each declaration's label before hosts can advance independently.
+    // No later host/item can overwrite these descriptions.
+    let mut variables = task_name_variables(run_state, hosts);
+    let task_names: Vec<String> = all_tasks
+        .iter()
+        .map(|task| {
+            let name = task.get_display_name_with(&variables);
+            task.forget_name_variables(&mut variables);
+            name
+        })
+        .collect();
+
     // Build host name list and index map
     let host_names: Vec<String> = hosts
         .iter()
@@ -732,15 +782,16 @@ fn async_handle_batch(
                         h.name.clone(),
                         h.needs_provisioning(),
                         h.get_provision().cloned(),
-                        h.get_variables(),
+                        h.get_inventory_variables(),
                     )
                 };
 
                 if needs_provision && let Some(ref config) = provision_config {
                     let dns_key = serde_yaml::Value::String("dns".to_string());
-                    let dns_config = host_vars.get(&dns_key).and_then(|v| {
-                        serde_yaml::from_value::<crate::dns::DnsConfig>(v.clone()).ok()
-                    });
+                    let automation_root = run_state.context.read().unwrap().automation_root.clone();
+                    let dns_config = host_vars
+                        .get(&dns_key)
+                        .and_then(|v| crate::dns::dns_config_from_vars(v, &automation_root));
 
                     match ensure_host_provisioned(
                         config,
@@ -783,7 +834,7 @@ fn async_handle_batch(
 
                             if let Some(ref ip_addr) = ip {
                                 let key = serde_yaml::Value::String("jet_ssh_hostname".to_string());
-                                if !vars.contains_key(&key) {
+                                if !h.get_inventory_variables().contains_key(&key) {
                                     vars.insert(key, serde_yaml::Value::String(ip_addr.clone()));
                                     changed = true;
                                 }
@@ -791,7 +842,7 @@ fn async_handle_batch(
 
                             if let Some(ref ssh_user) = config.ssh_user {
                                 let key = serde_yaml::Value::String("jet_ssh_user".to_string());
-                                if !vars.contains_key(&key) {
+                                if !h.get_inventory_variables().contains_key(&key) {
                                     vars.insert(key, serde_yaml::Value::String(ssh_user.clone()));
                                     changed = true;
                                 }
@@ -867,7 +918,7 @@ fn async_handle_batch(
                     continue;
                 }
 
-                let task_name = task.get_display_name();
+                let task_name = task_names[task_idx].clone();
                 let _ = host_tx.send(HostEvent::TaskStarted {
                     host_idx,
                     task_name: task_name.clone(),
@@ -972,6 +1023,22 @@ fn check_tags(
     false
 }
 
+fn task_name_variables(
+    run_state: &Arc<RunState>,
+    hosts: &[Arc<RwLock<Host>>],
+) -> serde_yaml::Mapping {
+    let context = run_state.context.read().unwrap();
+    if let Some(variables) = &context.naming_variables {
+        return variables.clone();
+    }
+    crate::tasks::naming::common_variables(hosts.iter().map(|host| {
+        context.get_complete_blended_variables(
+            host,
+            crate::handle::template::BlendTarget::NotTemplateModule,
+        )
+    }))
+}
+
 fn process_task(
     run_state: &Arc<RunState>,
     play: &Play,
@@ -997,7 +1064,11 @@ fn process_task(
     // we will run tasks with the FSM only if not skipped by tags
     let should_run = check_tags(run_state, task, role_invocation);
     if should_run {
-        run_state.context.write().unwrap().set_task(task);
+        let name = task.get_display_name_with(&task_name_variables(
+            run_state,
+            &hosts.values().cloned().collect::<Vec<_>>(),
+        ));
+        run_state.context.write().unwrap().task = Some(name);
         run_state
             .visitor
             .read()
@@ -1016,173 +1087,93 @@ fn process_role(
     invocation: &RoleInvocation,
     are_handlers: HandlerMode,
 ) -> Result<(), String> {
-    // traversal code for roles.  This is called twice, once for normal tasks and again when processing handler tasks.
-
-    // we traverse roles by seeing the 'invocation' in the playbook, which is different from the definition.
-    // the definition involves all of the role files in the role directory
-    let role_name = invocation.role.clone();
-
-    // check if this role has already been processed (via dependency resolution)
-    {
-        let processed = match are_handlers {
-            HandlerMode::NormalTasks => run_state.processed_role_tasks.read().unwrap(),
-            HandlerMode::Handlers => run_state.processed_role_handlers.read().unwrap(),
-        };
-        if processed.contains(&role_name) {
-            return Ok(());
-        }
-    }
-
-    // check for circular dependencies
-    {
-        let stack = run_state.role_processing_stack.read().unwrap();
-        if stack.contains(&role_name) {
-            let cycle: Vec<String> = stack.iter().cloned().collect();
-            return Err(format!(
-                "circular role dependency detected: {} -> {}",
-                cycle.join(" -> "),
-                role_name
-            ));
-        }
-    }
-
-    // add to processing stack for cycle detection
-    run_state
-        .role_processing_stack
-        .write()
-        .unwrap()
-        .push(role_name.clone());
-
-    // can we find a role directory in the configured role paths?
-    let (role, role_path) = find_role(run_state, play, role_name.clone())?;
-
-    // process dependencies first
-    if let Some(dependencies) = role.dependencies.as_ref() {
-        for dep_name in dependencies.iter() {
-            // create a synthetic invocation for the dependency
-            let dep_invocation = RoleInvocation {
-                role: dep_name.clone(),
-                vars: None,
-                tags: invocation.tags.clone(),
-            };
-            process_role(run_state, play, &dep_invocation, are_handlers)?;
-        }
-    }
-
-    // remove from processing stack (we're done checking for cycles for this role)
-    run_state.role_processing_stack.write().unwrap().pop();
-    {
-        // we're good.
-        let mut ctx = run_state.context.write().unwrap();
-        let str_path = directory_as_string(&role_path);
-        ctx.set_role(&role, invocation, &str_path);
-        if are_handlers == HandlerMode::NormalTasks {
-            ctx.increment_role_count();
-        }
-    }
-    run_state
-        .visitor
-        .read()
-        .unwrap()
-        .on_role_start(&run_state.context);
-
-    // roles contain two list of files to include, which one we're processing now
-    // depends on whether we are in handler mode or not
-
-    let files = match are_handlers {
-        HandlerMode::NormalTasks => role.tasks,
-        HandlerMode::Handlers => role.handlers,
+    // Roles are walked twice — once for normal tasks, again for handlers. The
+    // walk shape (resolution, deps-first ordering, cycle detection, per-section
+    // dedup) is shared with static analysis via `walk_role_tree`; this function
+    // supplies only the execution action per resolved role.
+    let section = match are_handlers {
+        HandlerMode::NormalTasks => RoleSection::Tasks,
+        HandlerMode::Handlers => RoleSection::Handlers,
     };
-
-    // the file sections are optional...
-
-    if let Some(files) = files {
-        // prepare to chdir into the role, this makes operating on template and file paths easier
-
-        let p1 = env::current_dir().expect("could not get current directory");
-        let previous = p1.as_path();
-        match env::set_current_dir(&role_path) {
-            Ok(_) => {}
-            Err(s) => {
-                return Err(format!(
-                    "could not chdir into role directory {:?}, {}",
-                    role_path, s
-                ));
+    let role_paths = run_state.role_paths.read().unwrap().clone();
+    walk_role_tree(
+        &**run_state,
+        &role_paths,
+        invocation,
+        section,
+        |inv, role_path, role| {
+            // set per-role context and notify the visitor
+            {
+                let mut ctx = run_state.context.write().unwrap();
+                let str_path = directory_as_string(role_path);
+                ctx.set_role(role, inv, &str_path);
+                if are_handlers == HandlerMode::NormalTasks {
+                    ctx.increment_role_count();
+                }
             }
-        }
+            run_state
+                .visitor
+                .read()
+                .unwrap()
+                .on_role_start(&run_state.context);
 
-        // for each task file path that is mentioned
+            // which file section we process depends on whether we are in handler mode
+            let files = match are_handlers {
+                HandlerMode::NormalTasks => role.tasks.as_ref(),
+                HandlerMode::Handlers => role.handlers.as_ref(),
+            };
 
-        for task_file in files.iter() {
-            // find the likely path location, which is organized into subdirectories for relative paths
+            if let Some(files) = files {
+                // chdir into the role so template and file paths resolve easily
+                let p1 = env::current_dir().expect("could not get current directory");
+                let previous = p1.as_path();
+                match env::set_current_dir(role_path) {
+                    Ok(_) => {}
+                    Err(s) => {
+                        return Err(format!(
+                            "could not chdir into role directory {:?}, {}",
+                            role_path, s
+                        ));
+                    }
+                }
 
-            let task_buf = match task_file.starts_with("/") {
-                true => Path::new(task_file).to_path_buf(),
-                false => {
-                    let mut pb = PathBuf::new();
-                    pb.push(role_path.clone());
-                    match are_handlers {
-                        HandlerMode::NormalTasks => {
-                            pb.push("tasks");
-                        }
-                        HandlerMode::Handlers => {
-                            pb.push("handlers");
+                for task_file in files.iter() {
+                    let task_buf = resolve_role_file(role_path, task_file, section);
+                    let task_fh = jet_file_open(task_buf.as_path())?;
+                    let parsed: Result<Vec<Task>, serde_yaml::Error> =
+                        serde_yaml::from_reader(task_fh);
+                    let tasks = match parsed {
+                        Ok(tasks) => tasks,
+                        Err(e) => {
+                            show_yaml_error_in_context(&e, task_buf.as_path());
+                            return Err("edit the file and try again?".to_string());
                         }
                     };
-                    pb.push(task_file);
-                    pb
+                    for task in tasks.iter() {
+                        // process_task is the same function used for loose tasks
+                        process_task(run_state, play, task, are_handlers, Some(inv))?;
+                    }
                 }
-            };
 
-            // parse the YAML file
-
-            let task_fh = jet_file_open(task_buf.as_path())?;
-            let parsed: Result<Vec<Task>, serde_yaml::Error> = serde_yaml::from_reader(task_fh);
-            let tasks = match parsed {
-                Ok(tasks) => tasks,
-                Err(e) => {
-                    show_yaml_error_in_context(&e, task_buf.as_path());
-                    return Err("edit the file and try again?".to_string());
+                match env::set_current_dir(previous) {
+                    Ok(_) => {}
+                    Err(s) => {
+                        return Err(format!(
+                            "could not restore previous directory after role evaluation: {:?}, {}",
+                            previous, s
+                        ));
+                    }
                 }
-            };
-            for task in tasks.iter() {
-                // process all tasks in the YAML file, this is the same function used
-                // for processing loose tasks outside of roles
-
-                process_task(run_state, play, task, are_handlers, Some(invocation))?;
             }
-        }
 
-        // we're done with the role so flip back to the previous directory
-
-        match env::set_current_dir(previous) {
-            Ok(_) => {}
-            Err(s) => {
-                return Err(format!(
-                    "could not restore previous directory after role evaluation: {:?}, {}",
-                    previous, s
-                ));
-            }
-        }
-    }
-
-    run_state
-        .visitor
-        .read()
-        .unwrap()
-        .on_role_stop(&run_state.context);
-
-    // mark role as processed so it won't run again if referenced as a dependency
-    {
-        let role_name = invocation.role.clone();
-        let mut processed = match are_handlers {
-            HandlerMode::NormalTasks => run_state.processed_role_tasks.write().unwrap(),
-            HandlerMode::Handlers => run_state.processed_role_handlers.write().unwrap(),
-        };
-        processed.insert(role_name);
-    }
-
-    Ok(())
+            run_state
+                .visitor
+                .read()
+                .unwrap()
+                .on_role_stop(&run_state.context);
+            Ok(())
+        },
+    )
 }
 
 // Factored types would require restructuring shared closures across the module
@@ -1249,25 +1240,126 @@ fn get_host_batches(
     (batch_size, batch_count, results)
 }
 
-fn get_play_hosts(run_state: &Arc<RunState>, play: &Play) -> Vec<Arc<RwLock<Host>>> {
-    // the hosts we want to talk to are the ones specified in the play but may
-    // be further constrained by the parameters --limit-hosts and limit--groups
-    // from the CLI.
-
-    // In pull mode, always use localhost regardless of what the play specifies
-    // If --groups is specified, use the group for this play index
-    let groups = if run_state.is_pull_mode {
-        &vec!["all".to_string()]
-    } else if let Some(ref play_groups) = run_state.play_groups {
+/// Resolve the concrete group names a play targets, after applying the
+/// `--groups` per-play-index override and templating any `{{ var }}` entries
+/// through the play-level variable scope. This is the single source of truth
+/// for play targeting — `validate_groups` and `get_play_hosts` both consume its
+/// output, so the (formerly duplicated) CLI-override ladder lives only here.
+///
+/// Scope available for templating is hostless and pre-targeting (groups select
+/// hosts, so a target group's own `group_vars` cannot resolve the group name —
+/// that would be circular). Precedence low→high: `group_vars/all` (inventory
+/// baseline) → play `defaults` → play `vars`/`vars_files` → CLI `-e` extra-vars.
+fn resolve_target_groups(run_state: &Arc<RunState>, play: &Play) -> Result<Vec<String>, String> {
+    // Pull mode targets localhost regardless of the play's declared groups.
+    if run_state.is_pull_mode {
+        return Ok(vec![String::from("all")]);
+    }
+    // CLI --groups overrides per play-index and skips templating entirely.
+    if let Some(ref play_groups) = run_state.play_groups {
         let play_index = run_state.context.read().unwrap().play_index;
         if let Some(group) = play_groups.get(play_index) {
-            &vec![group.clone()]
-        } else {
-            &play.groups
+            return Ok(vec![group.clone()]);
         }
-    } else {
-        &play.groups
-    };
+    }
+    // Otherwise template each declared group through the hostless play-level
+    // scope. Build the data mapping low→high: group_vars/all baseline, then the
+    // play's defaults/vars and -e extra-vars (via hostless_play_vars).
+    let mut data = serde_yaml::Value::from(serde_yaml::Mapping::new());
+    {
+        let inv = run_state.inventory.read().unwrap();
+        if inv.has_group("all") {
+            let baseline = inv.get_group("all").read().unwrap().get_variables();
+            blend_variables(&mut data, serde_yaml::Value::Mapping(baseline));
+        }
+    }
+    let ctx = run_state.context.read().unwrap();
+    blend_variables(&mut data, ctx.hostless_play_vars());
+    let templar = ctx.templar.read().unwrap();
+
+    let mut resolved: Vec<String> = Vec::with_capacity(play.groups.len());
+    for raw in play.groups.iter() {
+        // Non-templated entries pass through unchanged.
+        if !raw.contains("{{") {
+            resolved.push(raw.clone());
+            continue;
+        }
+        let mapping = match data.clone() {
+            serde_yaml::Value::Mapping(m) => m,
+            _ => serde_yaml::Mapping::new(),
+        };
+        let rendered = templar
+            .render(raw, mapping, TemplateMode::Strict)
+            .map_err(|e| {
+                format!(
+                    "play '{}': cannot resolve group '{}': {}",
+                    play.name, raw, e
+                )
+            })?;
+        let trimmed = rendered.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "play '{}': group '{}' resolved to an empty value",
+                play.name, raw
+            ));
+        }
+        resolved.push(trimmed.to_string());
+    }
+    Ok(resolved)
+}
+
+/// Resolve the set of host names the playbook(s) target — parse each playbook,
+/// resolve every play's groups (templating + membership). Used by the
+/// destroy-confirmation gate to scope its prompt to what the `-p` playbook
+/// actually touches, instead of the whole inventory.
+///
+/// Returns `Ok(Some(set))` only on full success. Returns `Ok(None)` when there
+/// is no playbook, or any play's groups can't be resolved (read/parse error,
+/// templating failure, or a play with no declared groups) — callers MUST treat
+/// `None` as "unknown, over-approximate" so the destroy prompt never silently
+/// under-counts a real destroy.
+pub(crate) fn resolve_playbook_targets(
+    run_state: &Arc<RunState>,
+) -> Result<Option<std::collections::HashSet<String>>, String> {
+    let playbook_paths = run_state.playbook_paths.read().unwrap().clone();
+    if playbook_paths.is_empty() {
+        return Ok(None);
+    }
+    let mut targets = std::collections::HashSet::new();
+    for path in &playbook_paths {
+        let file = match jet_file_open(path) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let plays: Vec<Play> = match serde_yaml::from_reader(file) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        for (play_index, play) in plays.iter().enumerate() {
+            // Mirror the run: set play_index so a --groups per-play override
+            // resolves against the right index.
+            run_state.context.write().unwrap().play_index = play_index;
+            let groups = match resolve_target_groups(run_state, play) {
+                Ok(g) => g,
+                Err(_) => return Ok(None),
+            };
+            if groups.is_empty() {
+                // A play with no declared groups is ambiguous → safe fallback.
+                return Ok(None);
+            }
+            for host in get_play_hosts(run_state, &groups) {
+                targets.insert(host.read().unwrap().name.clone());
+            }
+        }
+    }
+    Ok(Some(targets))
+}
+
+fn get_play_hosts(run_state: &Arc<RunState>, groups: &[String]) -> Vec<Arc<RwLock<Host>>> {
+    // the hosts we want to talk to are the resolved play groups, possibly
+    // further constrained by --limit-hosts / --limit-groups. Group resolution
+    // (templating, --groups override, pull-mode) is done by resolve_target_groups.
+
     let mut results: HashMap<String, Arc<RwLock<Host>>> = HashMap::new();
 
     let has_group_limits = !matches!(run_state.limit_groups.len(), 0);
@@ -1695,29 +1787,13 @@ fn validate_limit_hosts(run_state: &Arc<RunState>, _play: &Play) -> Result<(), S
     Ok(())
 }
 
-fn validate_groups(run_state: &Arc<RunState>, play: &Play) -> Result<(), String> {
-    // In pull mode, we don't validate groups since they'll all be mapped to localhost
-    if run_state.is_pull_mode {
-        return Ok(());
-    }
-
-    // If --groups is specified, validate the remapped group instead
-    let groups_to_validate = if let Some(ref play_groups) = run_state.play_groups {
-        let play_index = run_state.context.read().unwrap().play_index;
-        if let Some(group) = play_groups.get(play_index) {
-            vec![group.clone()]
-        } else {
-            play.groups.clone()
-        }
-    } else {
-        play.groups.clone()
-    };
-
-    // groups on the play can't mention any groups that aren't in inventory
-
+fn validate_groups(run_state: &Arc<RunState>, groups: &[String]) -> Result<(), String> {
+    // Groups are already resolved (templated + CLI-override applied) by the
+    // caller (resolve_target_groups), so this only checks each name exists in
+    // inventory. The pull-mode / --groups branching now lives there too.
     let inv = run_state.inventory.read().unwrap();
-    for group_name in groups_to_validate.iter() {
-        if !inv.has_group(&group_name.clone()) {
+    for group_name in groups.iter() {
+        if !inv.has_group(group_name) {
             return Err(format!(
                 "at least one referenced group ({}) is not found in inventory",
                 group_name
@@ -1798,39 +1874,462 @@ fn load_vars_into_context(run_state: &Arc<RunState>, play: &Play) -> Result<(), 
     Ok(())
 }
 
-fn find_role(
-    run_state: &Arc<RunState>,
-    _play: &Play,
-    role_name: String,
-) -> Result<(Role, PathBuf), String> {
-    // when we need to find a role we look for it in the configured role paths
+#[cfg(test)]
+mod target_groups_tests {
+    //! Tests for `resolve_target_groups` — templating `play.groups` from the
+    //! play-level variable scope (#52). See the plan in
+    //! `.claude/plans/starry-brewing-tarjan.md`.
+    use super::*;
+    use crate::cli::parser::CliParser;
+    use crate::connection::no::NoFactory;
+    use crate::inventory::inventory::Inventory;
+    use crate::playbooks::context::PlaybookContext;
+    use crate::playbooks::visitor::{CheckMode, PlaybookVisitor};
+    use std::collections::{HashMap, HashSet};
 
-    for path_buf in run_state.role_paths.read().unwrap().iter() {
-        let mut pb = path_buf.clone();
-        pb.push(role_name.clone());
-        let mut pb2 = pb.clone();
-        pb2.push("role.yml");
+    /// Build a `serde_yaml::Mapping` of string→string pairs.
+    fn vars(pairs: &[(&str, &str)]) -> serde_yaml::Mapping {
+        let mut m = serde_yaml::Mapping::new();
+        for (k, v) in pairs {
+            m.insert(
+                serde_yaml::Value::String((*k).to_string()),
+                serde_yaml::Value::String((*v).to_string()),
+            );
+        }
+        m
+    }
 
-        // a role.yml file must exist in a directory once we find a directory with a matching
-        // name
-
-        if pb2.exists() {
-            let path = pb2.as_path();
-            let role_file = jet_file_open(path)?;
-
-            // deserialize the role file and make sure it is valid before returning
-
-            let parsed: Result<Role, serde_yaml::Error> = serde_yaml::from_reader(role_file);
-            let role = match parsed {
-                Ok(role) => role,
-                Err(e) => {
-                    show_yaml_error_in_context(&e, path);
-                    return Err("edit the file and try again?".to_string());
-                }
-            };
-
-            return Ok((role, pb));
+    /// Minimal `Play` targeting the given (possibly templated) groups.
+    fn play_with_groups(name: &str, groups: &[&str]) -> Play {
+        Play {
+            name: name.to_string(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            roles: None,
+            defaults: None,
+            vars: None,
+            vars_files: None,
+            sudo: None,
+            sudo_template: None,
+            ssh_user: None,
+            ssh_port: None,
+            tasks: None,
+            handlers: None,
+            batch_size: None,
+            instantiate: None,
         }
     }
-    Err(format!("role not found: {}", role_name))
+
+    /// Build a RunState. `all_vars` → group_vars/all; `play_vars` →
+    /// context.vars_storage (as if `load_vars_into_context` had run);
+    /// `extra` → CLI `-e`. `play_groups`/`is_pull_mode` wire the CLI knobs.
+    /// Each named group gets one host `<group>-host`.
+    fn run_state(
+        groups: &[&str],
+        all_vars: serde_yaml::Mapping,
+        play_vars: serde_yaml::Mapping,
+        extra: serde_yaml::Mapping,
+        play_groups: Option<Vec<String>>,
+        is_pull_mode: bool,
+    ) -> Arc<RunState> {
+        let mut inv = Inventory::new();
+        inv.store_group("all");
+        if !all_vars.is_empty() {
+            inv.store_group_variables("all", all_vars);
+        }
+        for g in groups {
+            inv.store_group(g);
+            inv.store_host(g, &format!("{}-host", g));
+        }
+        let inventory = Arc::new(RwLock::new(inv));
+
+        let mut parser = CliParser::new();
+        parser.extra_vars = serde_yaml::Value::Mapping(extra);
+        let context = Arc::new(RwLock::new(PlaybookContext::new(&parser)));
+        {
+            let mut ctx = context.write().unwrap();
+            *ctx.vars_storage.write().unwrap() = play_vars;
+            ctx.play_index = 0;
+        }
+
+        Arc::new(RunState {
+            inventory,
+            playbook_paths: Arc::new(RwLock::new(Vec::new())),
+            role_paths: Arc::new(RwLock::new(Vec::new())),
+            module_paths: Arc::new(RwLock::new(Vec::new())),
+            limit_hosts: Vec::new(),
+            limit_groups: Vec::new(),
+            batch_size: None,
+            context,
+            visitor: Arc::new(RwLock::new(PlaybookVisitor::new(CheckMode::No))),
+            connection_factory: Arc::new(RwLock::new(NoFactory::new())),
+            tags: None,
+            allow_localhost_delegation: false,
+            is_pull_mode,
+            syntax_mode: false,
+            play_groups,
+            output_handler: None,
+            async_mode: false,
+            playbook_contents: Vec::new(),
+            processed_role_tasks: Arc::new(RwLock::new(HashSet::new())),
+            processed_role_handlers: Arc::new(RwLock::new(HashSet::new())),
+            role_processing_stack: Arc::new(RwLock::new(Vec::new())),
+            fetched_files: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    #[test]
+    fn play_groups_template_from_play_vars() {
+        let rs = run_state(
+            &["webservers"],
+            vars(&[]),
+            vars(&[("g", "webservers")]),
+            vars(&[]),
+            None,
+            false,
+        );
+        let play = play_with_groups("web", &["{{ g }}"]);
+        let resolved = resolve_target_groups(&rs, &play).expect("templated group resolves");
+        assert_eq!(resolved, vec!["webservers".to_string()]);
+    }
+
+    #[test]
+    fn play_groups_template_from_group_vars_all() {
+        // group_vars/all supplies the mapping (the issue's primary intent).
+        let rs = run_state(
+            &["webservers"],
+            vars(&[("g", "webservers")]),
+            vars(&[]),
+            vars(&[]),
+            None,
+            false,
+        );
+        let play = play_with_groups("web", &["{{ g }}"]);
+        let resolved = resolve_target_groups(&rs, &play).expect("group_vars/all resolves");
+        assert_eq!(resolved, vec!["webservers".to_string()]);
+    }
+
+    #[test]
+    fn play_groups_extra_vars_beat_group_vars_all() {
+        // -e extra-vars win over group_vars/all (precedence high→low).
+        let rs = run_state(
+            &["prod-cluster"],
+            vars(&[("g", "from-all")]),
+            vars(&[]),
+            vars(&[("g", "from-extra")]),
+            None,
+            false,
+        );
+        let play = play_with_groups("web", &["{{ g }}"]);
+        let resolved = resolve_target_groups(&rs, &play).expect("extra-vars resolves");
+        assert_eq!(resolved, vec!["from-extra".to_string()]);
+    }
+
+    #[test]
+    fn play_groups_undefined_var_is_a_clear_error() {
+        let rs = run_state(
+            &["webservers"],
+            vars(&[]),
+            vars(&[]),
+            vars(&[]),
+            None,
+            false,
+        );
+        let play = play_with_groups("web", &["{{ nope }}"]);
+        let err = resolve_target_groups(&rs, &play).expect_err("undefined var must error");
+        // message names the play and the offending token
+        assert!(err.contains("web"), "error names play: {}", err);
+        assert!(err.contains("nope"), "error names token: {}", err);
+    }
+
+    #[test]
+    fn play_groups_empty_resolved_is_rejected() {
+        let rs = run_state(
+            &["webservers"],
+            vars(&[]),
+            vars(&[("g", "")]),
+            vars(&[]),
+            None,
+            false,
+        );
+        let play = play_with_groups("web", &["{{ g }}"]);
+        let err = resolve_target_groups(&rs, &play).expect_err("empty group must error");
+        assert!(err.contains("empty"), "error mentions empty: {}", err);
+    }
+
+    #[test]
+    fn play_groups_static_entries_pass_through() {
+        // A group with no template markers is returned verbatim.
+        let rs = run_state(
+            &["webservers"],
+            vars(&[]),
+            vars(&[]),
+            vars(&[]),
+            None,
+            false,
+        );
+        let play = play_with_groups("web", &["webservers"]);
+        let resolved = resolve_target_groups(&rs, &play).expect("static group passes through");
+        assert_eq!(resolved, vec!["webservers".to_string()]);
+    }
+
+    #[test]
+    fn play_groups_cli_override_wins_per_play_index() {
+        // --groups for this play-index overrides templating entirely.
+        let rs = run_state(
+            &["override-group"],
+            vars(&[]),
+            vars(&[("g", "would-be-templated")]),
+            vars(&[]),
+            Some(vec!["override-group".to_string()]),
+            false,
+        );
+        let play = play_with_groups("web", &["{{ g }}"]);
+        let resolved = resolve_target_groups(&rs, &play).expect("CLI override resolves");
+        assert_eq!(resolved, vec!["override-group".to_string()]);
+    }
+
+    #[test]
+    fn play_groups_pull_mode_targets_all() {
+        let rs = run_state(
+            &["webservers"],
+            vars(&[]),
+            vars(&[("g", "ignored")]),
+            vars(&[]),
+            None,
+            true,
+        );
+        let play = play_with_groups("web", &["{{ g }}"]);
+        let resolved = resolve_target_groups(&rs, &play).expect("pull mode resolves");
+        assert_eq!(resolved, vec!["all".to_string()]);
+    }
+
+    #[test]
+    fn validate_groups_rejects_unknown_resolved_group() {
+        let rs = run_state(
+            &["webservers"],
+            vars(&[]),
+            vars(&[]),
+            vars(&[]),
+            None,
+            false,
+        );
+        let err = validate_groups(&rs, &["nope".to_string()]).expect_err("unknown group rejected");
+        assert!(err.contains("nope"), "error names the group: {}", err);
+    }
+
+    #[test]
+    fn validate_groups_accepts_known_group() {
+        let rs = run_state(
+            &["webservers"],
+            vars(&[]),
+            vars(&[]),
+            vars(&[]),
+            None,
+            false,
+        );
+        validate_groups(&rs, &["webservers".to_string()]).expect("known group validates");
+    }
+
+    #[test]
+    fn get_play_hosts_fans_out_resolved_group() {
+        let rs = run_state(
+            &["webservers", "dbservers"],
+            vars(&[]),
+            vars(&[]),
+            vars(&[]),
+            None,
+            false,
+        );
+        let hosts = get_play_hosts(&rs, &["webservers".to_string()]);
+        let names: Vec<String> = hosts
+            .iter()
+            .map(|h| h.read().unwrap().name.clone())
+            .collect();
+        assert_eq!(names, vec!["webservers-host".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod env_axis_groups_composition_tests {
+    //! End-to-end composition of the **environment axis** (#60) with templated
+    //! `play.groups` (#52). An environment's `secrets_inventory` overlay is
+    //! loaded last → later-wins, so a var it pins (e.g. `target`) lands in
+    //! `group_vars/all`, exactly where `resolve_target_groups` reads it to
+    //! template the targeted group. One playbook then fans out to the
+    //! environment-specific cluster with no per-env playbook duplication.
+    //!
+    //! This stitches the real layers the runtime chains — `load_inventory` →
+    //! `resolve_target_groups` → `get_play_hosts` — with no mocks and no
+    //! injected context vars. The load list is exactly the shape
+    //! `CliParser::inventory_load_paths()` yields once the selected environment
+    //! appends its overlay (main inventory first, env secrets last). The
+    //! `--environment` flag → append step is covered by the parser's own unit
+    //! tests; this module owns the previously-untested seam between them: that a
+    //! var arriving via a loaded overlay is visible to templating.
+    use super::*;
+    use crate::cli::parser::CliParser;
+    use crate::connection::no::NoFactory;
+    use crate::inventory::inventory::Inventory;
+    use crate::inventory::loading::load_inventory;
+    use crate::playbooks::context::PlaybookContext;
+    use crate::playbooks::visitor::{CheckMode, PlaybookVisitor};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    /// Write a topology group `name` (with `members`) under `<dir>/groups/`.
+    fn write_group(dir: &Path, name: &str, members: &[&str]) {
+        let groups = dir.join("groups");
+        fs::create_dir_all(&groups).unwrap();
+        let mut body = String::from("hosts:\n");
+        for m in members {
+            body.push_str(&format!("  - {}\n", m));
+        }
+        fs::write(groups.join(name), body).unwrap();
+    }
+
+    /// Write a vars-only overlay (the `secrets_inventory` shape — no `groups/`
+    /// dir) carrying `group_vars/all`. This is what an environment overlay path
+    /// looks like on disk.
+    fn write_all_vars_overlay(dir: &Path, all_yaml: &str) {
+        let gv = dir.join("group_vars");
+        fs::create_dir_all(&gv).unwrap();
+        fs::write(gv.join("all"), all_yaml).unwrap();
+    }
+
+    /// Minimal `Play` targeting the given (possibly templated) groups.
+    fn play_with_groups(name: &str, groups: &[&str]) -> Play {
+        Play {
+            name: name.to_string(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            roles: None,
+            defaults: None,
+            vars: None,
+            vars_files: None,
+            sudo: None,
+            sudo_template: None,
+            ssh_user: None,
+            ssh_port: None,
+            tasks: None,
+            handlers: None,
+            batch_size: None,
+            instantiate: None,
+        }
+    }
+
+    /// Build a `RunState` around an already-loaded inventory. No vars are
+    /// injected into the context — the templated group name must come from the
+    /// inventory's merged `group_vars/all` (populated by the loaded environment
+    /// overlay), not from play/CLI vars. That isolates the overlay as the sole
+    /// var source, so the test's causality is unambiguous.
+    fn run_state_with_inventory(inventory: Arc<RwLock<Inventory>>) -> Arc<RunState> {
+        let mut parser = CliParser::new();
+        parser.extra_vars = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let context = Arc::new(RwLock::new(PlaybookContext::new(&parser)));
+        {
+            let mut ctx = context.write().unwrap();
+            *ctx.vars_storage.write().unwrap() = serde_yaml::Mapping::new();
+            ctx.play_index = 0;
+        }
+        Arc::new(RunState {
+            inventory,
+            playbook_paths: Arc::new(RwLock::new(Vec::new())),
+            role_paths: Arc::new(RwLock::new(Vec::new())),
+            module_paths: Arc::new(RwLock::new(Vec::new())),
+            limit_hosts: Vec::new(),
+            limit_groups: Vec::new(),
+            batch_size: None,
+            context,
+            visitor: Arc::new(RwLock::new(PlaybookVisitor::new(CheckMode::No))),
+            connection_factory: Arc::new(RwLock::new(NoFactory::new())),
+            tags: None,
+            allow_localhost_delegation: false,
+            is_pull_mode: false,
+            syntax_mode: false,
+            play_groups: None,
+            output_handler: None,
+            async_mode: false,
+            playbook_contents: Vec::new(),
+            processed_role_tasks: Arc::new(RwLock::new(HashSet::new())),
+            processed_role_handlers: Arc::new(RwLock::new(HashSet::new())),
+            role_processing_stack: Arc::new(RwLock::new(Vec::new())),
+            fetched_files: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    #[test]
+    fn environment_overlay_supplies_templated_group_var() {
+        // On-disk world: one site inventory carrying both clusters' topology,
+        // plus a vars-only environment overlay pinning which cluster this run
+        // targets. Loaded exactly as the runtime would once `--environment test`
+        // appends the overlay: main first, env overlay last (later-wins).
+        let root = TempDir::new().unwrap();
+        let main = root.path().join("inv");
+        write_group(&main, "webservers", &["web1"]);
+        write_group(&main, "test-webservers", &["testweb1"]);
+        let overlay = root.path().join("sec-env");
+        write_all_vars_overlay(&overlay, "target: test-webservers\n");
+
+        let inventory = Arc::new(RwLock::new(Inventory::new()));
+        let load_list: Arc<RwLock<Vec<PathBuf>>> =
+            Arc::new(RwLock::new(vec![main.clone(), overlay.clone()]));
+        load_inventory(
+            &inventory,
+            load_list,
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        )
+        .expect("main + env overlay load");
+
+        // The environment overlay's var reached group_vars/all (later-wins merge).
+        let all_vars = inventory
+            .read()
+            .unwrap()
+            .get_group("all")
+            .read()
+            .unwrap()
+            .get_variables();
+        assert_eq!(all_vars["target"], "test-webservers");
+
+        // Templated play.groups resolves the env-supplied name → the
+        // environment-specific cluster → correct host fan-out.
+        let rs = run_state_with_inventory(inventory);
+        let play = play_with_groups("k3s", &["{{ target }}"]);
+        let groups = resolve_target_groups(&rs, &play)
+            .expect("env-overlay var resolves the templated group");
+        assert_eq!(groups, vec!["test-webservers".to_string()]);
+
+        let hosts = get_play_hosts(&rs, &groups);
+        let names: Vec<String> = hosts
+            .iter()
+            .map(|h| h.read().unwrap().name.clone())
+            .collect();
+        assert_eq!(names, vec!["testweb1".to_string()]);
+    }
+
+    #[test]
+    fn templated_group_fails_without_the_environment_overlay() {
+        // Causality check: with NO environment overlay in the load list, `target`
+        // is undefined and Strict templating must reject it with a clear error —
+        // proving the var above genuinely came from the overlay, not elsewhere.
+        let root = TempDir::new().unwrap();
+        let main = root.path().join("inv");
+        write_group(&main, "webservers", &["web1"]);
+        write_group(&main, "test-webservers", &["testweb1"]);
+
+        let inventory = Arc::new(RwLock::new(Inventory::new()));
+        load_inventory(
+            &inventory,
+            Arc::new(RwLock::new(vec![main.clone()])),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        )
+        .expect("main inventory alone loads");
+
+        let rs = run_state_with_inventory(inventory);
+        let play = play_with_groups("k3s", &["{{ target }}"]);
+        let err = resolve_target_groups(&rs, &play)
+            .expect_err("undefined var without the overlay must error");
+        assert!(err.contains("k3s"), "error names the play: {}", err);
+        assert!(err.contains("target"), "error names the token: {}", err);
+    }
 }

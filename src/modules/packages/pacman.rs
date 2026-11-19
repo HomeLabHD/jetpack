@@ -22,18 +22,107 @@ use std::sync::Arc;
 
 const MODULE: &str = "pacman";
 
+impl super::batch::BatchedPackage for PacmanAction {
+    fn package_name(&self) -> &str {
+        &self.package
+    }
+    fn query_batch_change(
+        &self,
+        handle: &Arc<TaskHandle>,
+        request: &Arc<TaskRequest>,
+        installed: Option<PackageDetails>,
+    ) -> Result<Arc<TaskResponse>, Arc<TaskResponse>> {
+        if self.update
+            && !self.remove
+            && let Some(installed) = &installed
+        {
+            let command = format!("pacman -Si -- {}", super::batch::quote(&self.package));
+            let response = handle.remote.run(request, &command, CheckRc::Checked)?;
+            let candidate = self
+                .parse_package_details(&cmd_info(&response).1)
+                .ok_or_else(|| {
+                    handle
+                        .response
+                        .is_failed(request, "unable to parse pacman repository version")
+                })?;
+            return Ok(if installed.version == candidate.version {
+                handle.response.is_matched(request)
+            } else {
+                handle
+                    .response
+                    .needs_modification(request, &[Field::Version])
+            });
+        }
+        self.query_installed_package(handle, request, installed)
+    }
+    fn query_batch(
+        &self,
+        handle: &Arc<TaskHandle>,
+        request: &Arc<TaskRequest>,
+        packages: &[Self],
+    ) -> Result<Vec<Option<PackageDetails>>, Arc<TaskResponse>> {
+        use super::batch::{query_output, quote, version_rows};
+        let names: Vec<_> = packages.iter().map(Self::get_actual_package).collect();
+        let args = names
+            .iter()
+            .map(|name| quote(name))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (rc, out) = query_output(handle, request, &format!("pacman -Q -- {args}"))?;
+        version_rows(handle, request, &names, &out, "was not found", rc)
+    }
+    fn apply_batch(
+        &self,
+        handle: &Arc<TaskHandle>,
+        request: &Arc<TaskRequest>,
+        packages: &[&Self],
+    ) -> Result<(), Arc<TaskResponse>> {
+        use super::batch::quote;
+        let removing = request.request_type == TaskRequestType::Remove;
+        let targets = packages
+            .iter()
+            .map(|package| {
+                quote(&if removing {
+                    package.get_actual_package()
+                } else {
+                    match &package.version {
+                        Some(version) => format!("{}={version}", package.package),
+                        None => package.package.clone(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let flags = if removing {
+            "-R --noconfirm --noprogressbar"
+        } else {
+            "-S --noconfirm --noprogressbar --needed"
+        };
+        handle.remote.run(
+            request,
+            &format!("pacman {flags} -- {targets}"),
+            CheckRc::Checked,
+        )?;
+        Ok(())
+    }
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct PacmanTask {
     pub name: Option<String>,
-    pub package: String,
+    pub package: ResourceInput,
     pub version: Option<String>,
     pub update: Option<String>,
     pub remove: Option<String>,
     pub with: Option<PreLogicInput>,
+    pub retry: Option<String>,
+    pub delay: Option<String>,
     pub and: Option<PostLogicInput>,
 }
 
+#[derive(Clone)]
 struct PacmanAction {
     pub package: String,
     pub version: Option<String>,
@@ -42,6 +131,14 @@ struct PacmanAction {
 }
 
 impl IsTask for PacmanTask {
+    fn name_variable_writes(&self) -> crate::tasks::naming::NameVariableWrites {
+        crate::tasks::naming::NameVariableWrites::None
+    }
+
+    fn generated_name(&self, context: &crate::tasks::naming::NamingContext<'_>) -> Option<String> {
+        Some(context.packages(&self.package, &self.remove, &self.update))
+    }
+
     fn get_module(&self) -> String {
         String::from(MODULE)
     }
@@ -58,35 +155,50 @@ impl IsTask for PacmanTask {
         request: &Arc<TaskRequest>,
         tm: TemplateMode,
     ) -> Result<EvaluatedTask, Arc<TaskResponse>> {
+        let package_names = self
+            .package
+            .template_no_spaces(handle, request, tm, "package")?;
+        let prototype = PacmanAction {
+            package: String::new(),
+            version: handle.template.string_option_no_spaces(
+                request,
+                tm,
+                &String::from("version"),
+                &self.version,
+            )?,
+            update: handle.template.boolean_option_default_false(
+                request,
+                tm,
+                &String::from("update"),
+                &self.update,
+            )?,
+            remove: handle.template.boolean_option_default_false(
+                request,
+                tm,
+                &String::from("remove"),
+                &self.remove,
+            )?,
+        };
         Ok(EvaluatedTask {
-            action: Arc::new(PacmanAction {
-                package: handle.template.string_no_spaces(
-                    request,
-                    tm,
-                    &String::from("package"),
-                    &self.package,
-                )?,
-                version: handle.template.string_option_no_spaces(
-                    request,
-                    tm,
-                    &String::from("version"),
-                    &self.version,
-                )?,
-                update: handle.template.boolean_option_default_false(
-                    request,
-                    tm,
-                    &String::from("update"),
-                    &self.update,
-                )?,
-                remove: handle.template.boolean_option_default_false(
-                    request,
-                    tm,
-                    &String::from("remove"),
-                    &self.remove,
-                )?,
-            }),
+            action: super::batch::action(
+                package_names
+                    .into_iter()
+                    .map(|package| PacmanAction {
+                        package,
+                        ..prototype.clone()
+                    })
+                    .collect(),
+                self.package.is_list(),
+            ),
             with: Arc::new(PreLogicInput::template(handle, request, tm, &self.with)?),
-            and: Arc::new(PostLogicInput::template(handle, request, tm, &self.and)?),
+            and: Arc::new(PostLogicInput::template(
+                handle,
+                request,
+                tm,
+                &self.and,
+                &self.retry,
+                &self.delay,
+            )?),
         })
     }
 }
@@ -243,5 +355,108 @@ impl PacmanAction {
             (Some(name), Some(version)) => Some(PackageDetails { name, version }),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod recovered_tests {
+    use super::*;
+    #[test]
+    fn test_pacman_action_get_actual_package() {
+        let action = PacmanAction {
+            package: "vim".to_string(),
+            version: None,
+            update: false,
+            remove: false,
+        };
+        assert_eq!(action.get_actual_package(), "vim");
+    }
+
+    #[test]
+    fn test_pacman_action_get_actual_package_with_repo() {
+        let action = PacmanAction {
+            package: "extra/vim".to_string(),
+            version: None,
+            update: false,
+            remove: false,
+        };
+        assert_eq!(action.get_actual_package(), "vim");
+    }
+
+    #[test]
+    fn test_pacman_action_get_actual_package_multiple_slashes() {
+        let action = PacmanAction {
+            package: "community/extra/vim".to_string(),
+            version: None,
+            update: false,
+            remove: false,
+        };
+        assert_eq!(action.get_actual_package(), "vim");
+    }
+
+    #[test]
+    fn test_pacman_action_is_update() {
+        let action = PacmanAction {
+            package: "vim".to_string(),
+            version: None,
+            update: true,
+            remove: false,
+        };
+        assert!(action.is_update());
+    }
+
+    #[test]
+    fn test_pacman_action_is_remove() {
+        let action = PacmanAction {
+            package: "vim".to_string(),
+            version: None,
+            update: false,
+            remove: true,
+        };
+        assert!(action.is_remove());
+    }
+
+    #[test]
+    fn test_pacman_action_get_version() {
+        let action = PacmanAction {
+            package: "vim".to_string(),
+            version: Some("9.0.1234-1".to_string()),
+            update: false,
+            remove: false,
+        };
+        assert_eq!(action.get_version(), Some("9.0.1234-1".to_string()));
+    }
+
+    #[test]
+    fn test_pacman_action_parse_package_details() {
+        let action = PacmanAction {
+            package: "vim".to_string(),
+            version: None,
+            update: false,
+            remove: false,
+        };
+
+        let output = "Name            : vim\nVersion         : 9.0.1234-1\nDescription     : Vi Improved, a highly configurable text editor\n";
+        let details = action.parse_package_details(&output.to_string());
+
+        assert!(details.is_some());
+        let details = details.unwrap();
+        assert_eq!(details.name, "vim");
+        assert_eq!(details.version, "9.0.1234-1");
+    }
+
+    #[test]
+    fn test_pacman_action_parse_package_details_not_found() {
+        let action = PacmanAction {
+            package: "notfound".to_string(),
+            version: None,
+            update: false,
+            remove: false,
+        };
+
+        let output = "";
+        let details = action.parse_package_details(&output.to_string());
+
+        assert!(details.is_none());
     }
 }

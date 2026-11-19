@@ -22,6 +22,20 @@ Links (currently outdated, will be updated soon)
 
 Please route all questions, help requests, and feature discussion to Discord. Thanks!
 
+## Commands
+
+Jetpack installs a single `jetpack` binary, with `jetp` symlinked to it as an alias — invoke either. The verbs name the intent, not the transport:
+
+| Command | What it does |
+|---|---|
+| `jetpack apply` | Converge remote hosts over SSH to the declared state. With a `.jetpack.yml` contract, runs zero-arg. |
+| `jetpack plan` | Show intended operations over SSH without changing anything (dry-run). |
+| `jetpack check` | Validate playbooks and inventory (syntax-check + inventory-check in one pass). |
+| `jetpack local` | Converge only the local machine (convention-based bootstrap; see below). |
+| `jetpack show-inventory` | Display resolved inventory hosts and groups. |
+
+The older transport-named verbs (`ssh`, `check-ssh`, `full-check`) still work as silent aliases.
+
 ## Local Bootstrap Defaults
 
 `jetp local` now supports a convention-based bootstrap flow from the current working directory.
@@ -60,7 +74,7 @@ Paths are resolved relative to the current repository root.
 When `jetp local` runs, Jetpack injects a small set of built-in variables for bootstrap-oriented repos:
 
 - `JET_CWD`
-- `JET_REPO_ROOT`
+- `JET_AUTOMATION_ROOT`
 - `JET_PLAYBOOK_DIR`
 - `JET_ROLES_DIR`
 - `JET_INVENTORY_DIR`

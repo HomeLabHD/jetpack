@@ -18,12 +18,13 @@
 // this may change later.
 
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
-use crate::inventory::loading::convert_json_vars;
+use crate::cli::config_file::{self, JetpackFileConfig};
+use crate::inventory::loading::{convert_json_vars, extra_vars_from_key_value};
 use crate::util::io::directory_as_string;
 use crate::util::io::jet_file_open;
+use crate::util::io::read_local_file;
 use crate::util::yaml::blend_variables;
 use crate::util::yaml::show_yaml_error_in_context;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -39,6 +40,14 @@ use std::vec::Vec;
 pub struct CliParser {
     pub playbook_paths: Arc<RwLock<Vec<PathBuf>>>,
     pub inventory_paths: Arc<RwLock<Vec<PathBuf>>>,
+    /// Operator-supplied secrets inventories (often gitignored / a sibling
+    /// repo), layered on top of `inventory_paths` at load time. Tracked
+    /// separately so `--no-secrets` can skip them and the summary can show them.
+    pub secrets_paths: Arc<RwLock<Vec<PathBuf>>>,
+    /// Secrets paths declared in the contract but missing on disk. Populated
+    /// only in non-mutating modes (mutating modes hard-error instead, #55) so
+    /// the resolution summary / notice can report "(missing — skipped)".
+    pub missing_secrets: Arc<RwLock<Vec<PathBuf>>>,
     pub role_paths: Arc<RwLock<Vec<PathBuf>>>,
     pub module_paths: Arc<RwLock<Vec<PathBuf>>>,
     pub limit_groups: Vec<String>,
@@ -52,6 +61,8 @@ pub struct CliParser {
     pub show_groups: Vec<String>,
     pub batch_size: Option<usize>,
     pub default_user: String,
+    /// Whether --user was explicitly supplied rather than using the implicit default.
+    pub user_set: bool,
     pub sudo: Option<String>,
     pub default_port: i64,
     pub threads: usize,
@@ -68,6 +79,34 @@ pub struct CliParser {
     pub chroot_path: Option<String>,
     pub no_browser: bool,
     pub port_set: bool,
+    pub check: bool,
+    /// `--no-secrets`: skip loading `secrets_inventory` overlays for this run.
+    pub no_secrets: bool,
+    /// Automation-repository root — a real git checkout, a marker walk-up, or
+    /// the working directory. Set in `parse()` via `util::repo::detect_automation_root`;
+    /// generators (DNS today) anchor their output paths here.
+    pub automation_root: PathBuf,
+    /// Explicit `--config PATH` override for the automation contract. When set,
+    /// `cli::config_file::locate_config` returns it verbatim; otherwise the
+    /// contract is auto-discovered upward from the working directory.
+    pub config_path: Option<PathBuf>,
+    /// `--profile NAME`: selects a named operator-truth preset from the
+    /// contract's `profiles:` map (overrides inventory + secrets_inventory).
+    /// When unset, `defaults.profile` is used.
+    pub profile: Option<String>,
+    /// The resolved profile name (CLI `--profile` or `defaults.profile`) after
+    /// `apply_file_defaults` — for the resolution summary.
+    pub active_profile: Option<String>,
+    /// `--environment NAME`: selects a named env overlay from the contract's
+    /// `environments:` map (appends its secrets_inventory on top of whatever a
+    /// profile selected). When unset, `defaults.environment` is used.
+    pub environment: Option<String>,
+    /// The resolved environment name (CLI `--environment` or
+    /// `defaults.environment`) after `apply_file_defaults` — for the summary.
+    pub active_environment: Option<String>,
+    /// `automation.source` from the contract, surfaced in the summary.
+    /// **Informational only** — Jetpack does not fetch it yet.
+    pub automation_source: Option<String>,
 }
 
 // subcommands are usually required
@@ -85,22 +124,22 @@ pub const CLI_MODE_PULL: u32 = 8;
 pub const CLI_MODE_INVENTORY_CHECK: u32 = 9;
 pub const CLI_MODE_FULL_CHECK: u32 = 10;
 pub const CLI_MODE_DOCS: u32 = 11;
+pub const CLI_MODE_GEN_REFERENCE: u32 = 12;
+pub const CLI_MODE_INSTALL: u32 = 13;
+// #49 verb family — name the intent, not the transport. `apply`/`run` converge
+// over SSH (run is apply under a less-loaded term, kept distinct so it can grow
+// an ad-hoc path later without a rename); `plan` is the dry-run. The old
+// transport-named verbs (`ssh`/`check-ssh`) stay parseable as silent aliases.
+pub const CLI_MODE_APPLY: u32 = 14;
+pub const CLI_MODE_RUN: u32 = 15;
+pub const CLI_MODE_PLAN: u32 = 16;
 
 const DEFAULT_LOCAL_PLAYBOOK: &str = "deploy/playbooks/bootstrap.yml";
 const DEFAULT_LOCAL_ROLES: &str = "deploy/roles";
 const DEFAULT_LOCAL_INVENTORY: &str = "deploy/inventory";
 
-#[derive(Debug, Default, Deserialize)]
-struct JetpackFileConfig {
-    local: Option<JetpackLocalConfig>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct JetpackLocalConfig {
-    playbook: Option<String>,
-    roles: Option<String>,
-    inventory: Option<String>,
-}
+// The `.jetpack.yml`/`.jetpack.yaml` contract schema, version gate, and search
+// order live in `cli::config_file`. Parser methods here load and consume it.
 
 fn is_cli_mode_valid(value: &str) -> bool {
     cli_mode_from_string(value).is_ok()
@@ -110,22 +149,112 @@ fn cli_mode_from_string(s: &str) -> Result<u32, String> {
     match s {
         "local" => Ok(CLI_MODE_LOCAL),
         "check-local" => Ok(CLI_MODE_CHECK_LOCAL),
+        // Intent-named verbs (#49) — the canonical, advertised converge/dry-run
+        // surface. `apply` and `run` both converge over SSH; `plan` is the
+        // dry-run; `check` validates (alias of the legacy `full-check`).
+        "apply" => Ok(CLI_MODE_APPLY),
+        "run" => Ok(CLI_MODE_RUN),
+        "plan" => Ok(CLI_MODE_PLAN),
+        "check" => Ok(CLI_MODE_FULL_CHECK),
+        // Legacy transport-named verbs — silent aliases (still work, not
+        // advertised, no deprecation warning in v1).
         "ssh" => Ok(CLI_MODE_SSH),
         "check-ssh" => Ok(CLI_MODE_CHECK_SSH),
+        "full-check" => Ok(CLI_MODE_FULL_CHECK),
         "__simulate" => Ok(CLI_MODE_SIMULATE),
         "show-inventory" => Ok(CLI_MODE_SHOW),
         "pull" => Ok(CLI_MODE_PULL),
         "syntax-check" => Ok(CLI_MODE_SYNTAX),
         "inventory-check" => Ok(CLI_MODE_INVENTORY_CHECK),
-        "full-check" => Ok(CLI_MODE_FULL_CHECK),
         "docs" => Ok(CLI_MODE_DOCS),
+        "gen-reference" => Ok(CLI_MODE_GEN_REFERENCE),
+        "install" => Ok(CLI_MODE_INSTALL),
         _ => Err(format!("invalid mode: {}", s)),
     }
 }
 
+/// User-facing CLI mode names, for the docs reference. Excludes the internal
+/// `__simulate` mode, the `UNSET` sentinel, and the legacy transport-named
+/// verbs (`ssh`/`check-ssh`/`full-check`) — those stay parseable as silent
+/// aliases but are no longer advertised, so the docs steer users to the
+/// intent-named verbs (`apply`/`run`/`plan`/`check`).
+pub fn all_mode_names() -> &'static [&'static str] {
+    &[
+        "local",
+        "check-local",
+        "apply",
+        "run",
+        "plan",
+        "check",
+        "show-inventory",
+        "pull",
+        "syntax-check",
+        "inventory-check",
+        "docs",
+        "install",
+    ]
+}
+
+/// The canonical name for a mode constant — round-trips with
+/// [`cli_mode_from_string`] for every name in [`all_mode_names`]. Used by the
+/// resolution summary and any other user-facing display. Returns `"unset"` for
+/// an unrecognized value rather than panicking.
+pub fn cli_mode_name(mode: u32) -> &'static str {
+    match mode {
+        CLI_MODE_LOCAL => "local",
+        CLI_MODE_CHECK_LOCAL => "check-local",
+        CLI_MODE_APPLY => "apply",
+        CLI_MODE_RUN => "run",
+        CLI_MODE_PLAN => "plan",
+        CLI_MODE_FULL_CHECK => "check",
+        CLI_MODE_SSH => "ssh",
+        CLI_MODE_CHECK_SSH => "check-ssh",
+        CLI_MODE_SIMULATE => "__simulate",
+        CLI_MODE_SHOW => "show-inventory",
+        CLI_MODE_PULL => "pull",
+        CLI_MODE_SYNTAX => "syntax-check",
+        CLI_MODE_INVENTORY_CHECK => "inventory-check",
+        CLI_MODE_DOCS => "docs",
+        CLI_MODE_GEN_REFERENCE => "gen-reference",
+        CLI_MODE_INSTALL => "install",
+        _ => "unset",
+    }
+}
+
+/// Whether `mode` executes automation against hosts (the human-facing run modes).
+/// The resolution summary prints only for these, so validation/utility modes —
+/// whose stdout may be machine-consumed or where a summary is just noise — stay
+/// clean. Nothing informational is ever routed to stderr.
+pub fn is_execution_mode(mode: u32) -> bool {
+    matches!(
+        mode,
+        CLI_MODE_SSH
+            | CLI_MODE_CHECK_SSH
+            | CLI_MODE_APPLY
+            | CLI_MODE_RUN
+            | CLI_MODE_PLAN
+            | CLI_MODE_LOCAL
+            | CLI_MODE_CHECK_LOCAL
+            | CLI_MODE_PULL
+            | CLI_MODE_SIMULATE
+    )
+}
+
+/// Whether `mode` mutates target hosts and therefore needs operator secrets
+/// (the `secrets_inventory` overlay). Distinct from `is_execution_mode`, which
+/// also includes the dry-runs (`plan`/`check-ssh`/`check-local`) — those don't
+/// mutate, so a missing secrets overlay there is warned+skipped, not fatal.
+/// Used by the #55 mode-aware missing-secrets gate.
+pub fn is_converging_mode(mode: u32) -> bool {
+    matches!(
+        mode,
+        CLI_MODE_APPLY | CLI_MODE_RUN | CLI_MODE_SSH | CLI_MODE_LOCAL | CLI_MODE_PULL
+    )
+}
+
 // all the supported flags
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, strum::EnumIter)]
 #[allow(non_camel_case_types)]
 pub enum Arguments {
     ARGUMENT_VERSION,
@@ -135,6 +264,7 @@ pub enum Arguments {
     ARGUMENT_PLAYBOOK_SHORT,
     ARGUMENT_ROLES,
     ARGUMENT_ROLES_SHORT,
+    ARGUMENT_CONFIG,
     ARGUMENT_SHOW_GROUPS,
     ARGUMENT_SHOW_HOSTS,
     ARGUMENT_LIMIT_GROUPS,
@@ -163,10 +293,15 @@ pub enum Arguments {
     ARGUMENT_URL,
     ARGUMENT_CHROOT,
     ARGUMENT_DOCS_NO_BROWSER,
+    ARGUMENT_CHECK,
+    ARGUMENT_NO_SECRETS,
+    ARGUMENT_PROFILE,
+    ARGUMENT_ENVIRONMENT,
+    ARGUMENT_ENVIRONMENT_SHORT,
 }
 
 impl Arguments {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Arguments::ARGUMENT_VERSION => "--version",
             Arguments::ARGUMENT_INVENTORY => "--inventory",
@@ -175,6 +310,7 @@ impl Arguments {
             Arguments::ARGUMENT_PLAYBOOK_SHORT => "-p",
             Arguments::ARGUMENT_ROLES => "--roles",
             Arguments::ARGUMENT_ROLES_SHORT => "-r",
+            Arguments::ARGUMENT_CONFIG => "--config",
             Arguments::ARGUMENT_MODULES => "--modules",
             Arguments::ARGUMENT_MODULES_SHORT => "-m",
             Arguments::ARGUMENT_SHOW_GROUPS => "--show-groups",
@@ -203,6 +339,11 @@ impl Arguments {
             Arguments::ARGUMENT_URL => "--url",
             Arguments::ARGUMENT_CHROOT => "--chroot",
             Arguments::ARGUMENT_DOCS_NO_BROWSER => "--no-browser",
+            Arguments::ARGUMENT_CHECK => "--check",
+            Arguments::ARGUMENT_NO_SECRETS => "--no-secrets",
+            Arguments::ARGUMENT_PROFILE => "--profile",
+            Arguments::ARGUMENT_ENVIRONMENT => "--environment",
+            Arguments::ARGUMENT_ENVIRONMENT_SHORT => "-E",
         }
     }
 }
@@ -216,6 +357,7 @@ fn build_argument_map() -> HashMap<String, Arguments> {
         (Arguments::ARGUMENT_PLAYBOOK, "--playbook"),
         (Arguments::ARGUMENT_PLAYBOOK_SHORT, "-p"),
         (Arguments::ARGUMENT_ROLES, "--roles"),
+        (Arguments::ARGUMENT_CONFIG, "--config"),
         (Arguments::ARGUMENT_MODULES, "--modules"),
         (Arguments::ARGUMENT_MODULES_SHORT, "-m"),
         (Arguments::ARGUMENT_ROLES_SHORT, "-r"),
@@ -251,6 +393,11 @@ fn build_argument_map() -> HashMap<String, Arguments> {
         (Arguments::ARGUMENT_URL, "--url"),
         (Arguments::ARGUMENT_CHROOT, "--chroot"),
         (Arguments::ARGUMENT_DOCS_NO_BROWSER, "--no-browser"),
+        (Arguments::ARGUMENT_CHECK, "--check"),
+        (Arguments::ARGUMENT_NO_SECRETS, "--no-secrets"),
+        (Arguments::ARGUMENT_PROFILE, "--profile"),
+        (Arguments::ARGUMENT_ENVIRONMENT, "--environment"),
+        (Arguments::ARGUMENT_ENVIRONMENT_SHORT, "-E"),
     ];
     let mut map: HashMap<String, Arguments> = HashMap::new();
     for (e, i) in inputs.iter() {
@@ -291,13 +438,15 @@ fn show_help() {
                       | |\n\
                       | | docs | builds and serves the documentation site locally (opens in your browser; use --no-browser over SSH)\n\
                       | |\n\
+                      | | install | copies the running jetpack binary to /usr/local/bin/jetpack and symlinks /usr/local/bin/jetp to it\n\
+                      | |\n\
                       | --- | --- | ---\n\
                       | validation: |\n\
                       | | syntax-check | statically validate playbooks/roles/tasks/templates (no hosts, no execution)\n\
                       | |\n\
                       | | inventory-check | validate an inventory tree (groups/group_vars/host_vars)\n\
                       | |\n\
-                      | | full-check | run syntax-check and inventory-check in one pass\n\
+                      | | check | run syntax-check and inventory-check in one pass\n\
                       | |\n\
                       | --- | --- | ---\n\
                       | local machine management: |\n\
@@ -309,9 +458,11 @@ fn show_help() {
                       | |\n\
                       | --- | --- | ---\n\
                       | remote machine management: |\n\
-                      | | check-ssh | looks for configuration differences over SSH\n\
+                      | | plan | shows intended operations over SSH without changing anything (dry-run)\n\
                       | |\n\
-                      | | ssh| manages multiple machines over SSH\n\
+                      | | apply | converges multiple machines over SSH to the declared state (with a .jetpack.yml, runs zero-arg)\n\
+                      | |\n\
+                      | | run | same converge path as apply, under a less-loaded name\n\
                       |-|-";
 
     crate::util::terminal::markdown_print(&String::from(mode_table));
@@ -323,9 +474,11 @@ fn show_help() {
                        | Basics:\n\
                        | | -p, --playbook path1:path2| specifies automation content\n\
                        | |\n\
-                       | | -i, --inventory path1:path2| (required for ssh only) specifies which systems to manage\n\
+                       | | -i, --inventory path1:path2| (required for apply/plan) specifies which systems to manage\n\
                        | |\n\
                        | | -r, --roles path1:path2| adds additional role search paths. Also uses $JET_ROLES_PATH\n\
+                       | |\n\
+                       | | --config path| explicit .jetpack.yml/.yaml contract (auto-discovered upward from the automation root by default)\n\
                        | |\n\
                        | --- | ---\n\
                        | SSH options:\n\
@@ -333,7 +486,7 @@ fn show_help() {
                        | |\n\
                        | | --batch-size N| fully configure this many hosts before moving to the next batch\n\
                        | |\n\
-                       | | --forward-agent | enables SSH agent forwarding but only on specific tasks (ex: git)\n\
+                       | | --forward-agent | enables SSH agent forwarding for specific tasks (ex: git); requires ssh on the controller\n\
                        | |\n\
                        | | --limit-groups group1:group2 | further limits scope for playbook runs\n\
                        | |\n\
@@ -380,6 +533,8 @@ impl CliParser {
         CliParser {
             playbook_paths: Arc::new(RwLock::new(Vec::new())),
             inventory_paths: Arc::new(RwLock::new(Vec::new())),
+            secrets_paths: Arc::new(RwLock::new(Vec::new())),
+            missing_secrets: Arc::new(RwLock::new(Vec::new())),
             role_paths: Arc::new(RwLock::new(Vec::new())),
             module_paths: Arc::new(RwLock::new(Vec::new())),
             needs_help: false,
@@ -388,6 +543,7 @@ impl CliParser {
             show_hosts: Vec::new(),
             show_groups: Vec::new(),
             batch_size: None,
+            user_set: false,
             default_user: match env::var("JET_SSH_USER") {
                 Ok(x) => {
                     println!("$JET_SSH_USER: {}", x);
@@ -445,6 +601,15 @@ impl CliParser {
             chroot_path: None,
             no_browser: false,
             port_set: false,
+            check: false,
+            no_secrets: false,
+            automation_root: std::env::current_dir().unwrap_or_default(),
+            config_path: None,
+            profile: None,
+            active_profile: None,
+            environment: None,
+            active_environment: None,
+            automation_source: None,
         }
     }
 
@@ -532,6 +697,8 @@ impl CliParser {
                             Arguments::ARGUMENT_ASK_LOGIN_PASSWORD => self.store_login_password(),
                             Arguments::ARGUMENT_ASYNC => self.store_async_mode(),
                             Arguments::ARGUMENT_DOCS_NO_BROWSER => self.store_no_browser(),
+                            Arguments::ARGUMENT_CHECK => self.store_check(),
+                            Arguments::ARGUMENT_NO_SECRETS => self.store_no_secrets(),
                             _ => {
                                 standalone_arg_found = false;
                                 next_is_value = true;
@@ -562,6 +729,16 @@ impl CliParser {
                                     }
                                     Arguments::ARGUMENT_MODULES_SHORT => {
                                         self.append_modules(&args[arg_count])
+                                    }
+                                    Arguments::ARGUMENT_CONFIG => {
+                                        self.store_config(&args[arg_count])
+                                    }
+                                    Arguments::ARGUMENT_PROFILE => {
+                                        self.store_profile(&args[arg_count])
+                                    }
+                                    Arguments::ARGUMENT_ENVIRONMENT
+                                    | Arguments::ARGUMENT_ENVIRONMENT_SHORT => {
+                                        self.store_environment(&args[arg_count])
                                     }
                                     Arguments::ARGUMENT_INVENTORY => {
                                         self.append_inventory(&args[arg_count])
@@ -636,13 +813,30 @@ impl CliParser {
             CLI_MODE_SHOW => self.threads = 1,
             CLI_MODE_PULL => self.threads = 1,
             CLI_MODE_DOCS => self.threads = 1,
+            CLI_MODE_GEN_REFERENCE => self.threads = 1,
+            CLI_MODE_INSTALL => self.threads = 1,
             CLI_MODE_UNSET => {
                 self.needs_help = true;
             }
             _ => {}
         }
 
-        self.apply_local_bootstrap_defaults()?;
+        // Resolve the automation-repository root once (git checkout → marker
+        // walk-up → current directory). DNS generators and upcoming kubectl/helm
+        // file resolution anchor their output paths here instead of the bare
+        // working directory, so a playbook run from a subdirectory writes zone
+        // files under the repo root rather than next to the playbook.
+        let cwd = fs::canonicalize(env::current_dir().map_err(|e| e.to_string())?)
+            .map_err(|e| format!("failed to canonicalize current directory: {e}"))?;
+        self.automation_root = crate::util::repo::detect_automation_root(&cwd);
+
+        // Apply defaults in precedence order: CLI flags (already parsed) win,
+        // then the `.jetpack` contract (all playbook modes), then — for local
+        // mode only — the deploy/ conventions. apply_file_defaults flips
+        // playbook_set/inventory_set when the contract supplies them, so a
+        // zero-arg `jetp ssh` passes the main.rs required-arg gates.
+        self.apply_file_defaults(&cwd)?;
+        self.apply_local_bootstrap_defaults(&cwd)?;
 
         if self.playbook_set {
             self.add_role_paths_from_environment()?;
@@ -650,6 +844,18 @@ impl CliParser {
             self.add_module_paths_from_environment()?;
             self.add_implicit_module_paths()?;
         }
+
+        // Surface JET_* builtins (JET_AUTOMATION_ROOT, JET_PLAYBOOK_DIR, …) for every
+        // playbook-executing mode — not just local. Pure-utility modes do no
+        // templating and skip this.
+        match self.mode {
+            CLI_MODE_SHOW | CLI_MODE_DOCS | CLI_MODE_GEN_REFERENCE | CLI_MODE_INSTALL => {}
+            _ => {
+                let automation_root = self.automation_root.clone();
+                self.inject_builtin_vars(&cwd, &automation_root)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -658,7 +864,13 @@ impl CliParser {
             self.mode = cli_mode_from_string(value).unwrap();
             return Ok(());
         }
-        Err(format!("jetp mode ({}) is not valid, see --help", value))
+        // Echo the bad verb and list the canonical modes so the user can
+        // self-correct without digging through --help.
+        Err(format!(
+            "unknown jetpack mode '{}' — valid modes are: {} (see --help)",
+            value,
+            all_mode_names().join(", ")
+        ))
     }
 
     fn append_playbook(&mut self, value: &str) -> Result<(), String> {
@@ -666,15 +878,11 @@ impl CliParser {
         match parse_paths(&String::from("-p/--playbook"), value) {
             Ok(paths) => {
                 for p in paths.iter() {
-                    if p.is_file() {
-                        let full = std::fs::canonicalize(p.as_path()).unwrap();
-                        self.playbook_paths
-                            .write()
-                            .unwrap()
-                            .push(full.to_path_buf());
-                    } else {
-                        return Err(format!("playbook file missing: {:?}", p));
-                    }
+                    let resolved = resolve_playbook_path(p).map_err(|err| {
+                        format!("{} {}", Arguments::ARGUMENT_PLAYBOOK.as_str(), err)
+                    })?;
+                    let full = std::fs::canonicalize(&resolved).unwrap();
+                    self.playbook_paths.write().unwrap().push(full);
                 }
             }
             Err(err_msg) => {
@@ -753,6 +961,34 @@ impl CliParser {
             }
         }
         Ok(())
+    }
+
+    /// Append a `secrets_inventory` path (from the contract or a future flag).
+    /// Does NOT flip `inventory_set` — secrets are a separate overlay, so a
+    /// `--no-secrets` run and the `Secrets:` summary line can distinguish them.
+    fn append_secrets(&mut self, value: &str) -> Result<(), String> {
+        match parse_paths(&String::from("secrets_inventory"), value) {
+            Ok(paths) => {
+                for p in paths.iter() {
+                    self.secrets_paths.write().unwrap().push(p.clone());
+                }
+            }
+            Err(err_msg) => {
+                return Err(format!("secrets_inventory {}", err_msg));
+            }
+        }
+        Ok(())
+    }
+
+    /// The inventory paths to actually load: main inventory followed by the
+    /// secrets overlay (unless `--no-secrets`). Order matters — secrets load
+    /// last so they layer with later-wins in the single propagate pass.
+    pub fn inventory_load_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.inventory_paths.read().unwrap().clone();
+        if !self.no_secrets {
+            paths.extend(self.secrets_paths.read().unwrap().iter().cloned());
+        }
+        paths
     }
 
     fn store_show_groups(&mut self, value: &str) -> Result<(), String> {
@@ -842,6 +1078,7 @@ impl CliParser {
 
     fn store_default_user(&mut self, value: &str) -> Result<(), String> {
         self.default_user = value.to_string();
+        self.user_set = true;
         Ok(())
     }
 
@@ -903,6 +1140,31 @@ impl CliParser {
         Ok(())
     }
 
+    fn store_check(&mut self) -> Result<(), String> {
+        self.check = true;
+        Ok(())
+    }
+
+    fn store_no_secrets(&mut self) -> Result<(), String> {
+        self.no_secrets = true;
+        Ok(())
+    }
+
+    fn store_config(&mut self, value: &str) -> Result<(), String> {
+        self.config_path = Some(PathBuf::from(value));
+        Ok(())
+    }
+
+    fn store_profile(&mut self, value: &str) -> Result<(), String> {
+        self.profile = Some(value.to_string());
+        Ok(())
+    }
+
+    fn store_environment(&mut self, value: &str) -> Result<(), String> {
+        self.environment = Some(value.to_string());
+        Ok(())
+    }
+
     fn increase_verbosity(&mut self, amount: u32) -> Result<(), String> {
         self.verbosity += amount;
         Ok(())
@@ -942,84 +1204,301 @@ impl CliParser {
         Ok(())
     }
 
-    fn apply_local_bootstrap_defaults(&mut self) -> Result<(), String> {
+    /// Render a contract `secrets_inventory` path by substituting the active
+    /// profile name into the `{profile}` placeholder.
+    ///
+    /// This is a **contract-time** substitution (the profile is selected in this
+    /// same `apply_file_defaults` pass), deliberately *not* `{{var}}` Templar
+    /// syntax — only `{profile}` is special, so the rest of a contract path
+    /// stays literal and can never be accidentally templated. A path that uses
+    /// `{profile}` with no profile selected is a configuration error: the
+    /// operator asked for a per-profile overlay but named no profile, so we
+    /// error clearly rather than silently substitute empty (a bogus path).
+    ///
+    /// Because `{`/`}` are YAML flow indicators, a `{profile}` path needs
+    /// quoting in flow style (`["../sec/{profile}-test"]`) or block style
+    /// (`  - ../sec/{profile}-test`) — the same rule that applies to `{{var}}`
+    /// everywhere else in Jetpack.
+    fn render_profile_in_path(path: &str, profile_name: Option<&str>) -> Result<String, String> {
+        if !path.contains("{profile}") {
+            return Ok(path.to_string());
+        }
+        match profile_name {
+            Some(name) => Ok(path.replace("{profile}", name)),
+            None => Err(format!(
+                "secrets_inventory path '{path}' uses {{profile}} but no profile is selected — \
+                 pass --profile or set defaults.profile so the placeholder can resolve."
+            )),
+        }
+    }
+
+    /// Apply `.jetpack` contract defaults for every playbook-executing mode —
+    /// the same mode set as `inject_builtin_vars` (everything but the pure
+    /// utility modes). Each of playbook/inventory/roles is filled ONLY when the
+    /// user did not supply it on the CLI, so precedence is CLI > file. Paths in
+    /// the contract resolve against the automation root, the way `Cargo.toml`
+    /// paths resolve against the package root.
+    fn apply_file_defaults(&mut self, cwd: &Path) -> Result<(), String> {
+        match self.mode {
+            CLI_MODE_SHOW | CLI_MODE_DOCS | CLI_MODE_GEN_REFERENCE | CLI_MODE_INSTALL => {
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let config = self.load_jetpack_file_config(cwd)?;
+        let mut defaults = config.effective();
+        let automation_root = self.automation_root.clone();
+
+        // Profile resolution (precedence: CLI --profile > defaults.profile). A
+        // selected profile overrides inventory + secrets_inventory ONLY — its
+        // playbook/roles stay from defaults. `Some(vec![])` clears that key;
+        // `None` inherits defaults. This override happens before the gated
+        // feeding below, so an explicit CLI -i still wins over the profile
+        // (the inventory feed is skipped when inventory_set).
+        let profile_name = self.profile.clone().or(defaults.profile.clone());
+        if let Some(name) = &profile_name {
+            let profile = config
+                .profiles
+                .as_ref()
+                .and_then(|p| p.get(name))
+                .ok_or_else(|| format!("profile '{}' not found in .jetpack.yml", name))?;
+            if let Some(inventory) = &profile.inventory {
+                defaults.inventory = inventory.clone();
+            }
+            if let Some(secrets) = &profile.secrets_inventory {
+                // `{profile}` self-substitutes the profile's own name (DRY:
+                // one path shape across sites, name self-fills).
+                defaults.secrets_inventory = secrets
+                    .iter()
+                    .map(|p| Self::render_profile_in_path(p, Some(name.as_str())))
+                    .collect::<Result<_, _>>()?;
+            }
+        }
+
+        // Environment resolution (precedence: CLI --environment >
+        // defaults.environment). Orthogonal to profile: an environment layers an
+        // env-scoped secrets overlay ON TOP of whatever profile/defaults selected
+        // — its `secrets_inventory` is appended (loaded last → later-wins). It
+        // affects secrets only, so `--no-secrets` skips the whole step (no error,
+        // no append); without `--no-secrets` an unknown environment is a clear
+        // error, since the operator asked for an overlay we can't find.
+        let environment_name = self.environment.clone().or(defaults.environment.clone());
+        // The environment affects secrets only, so `--no-secrets` skips the
+        // overlay entirely (folded into the Option to avoid a nested boolean
+        // `if`); an unknown environment is otherwise a clear error.
+        if let Some(name) = environment_name.as_ref().filter(|_| !self.no_secrets) {
+            let env = config
+                .environments
+                .as_ref()
+                .and_then(|e| e.get(name))
+                .ok_or_else(|| format!("environment '{}' not found in .jetpack.yml", name))?;
+            if let Some(secrets) = &env.secrets_inventory {
+                // `{profile}` substitutes the active profile name (resolved
+                // above), so a single env can layer <site>-test per profile.
+                for path in secrets {
+                    defaults
+                        .secrets_inventory
+                        .push(Self::render_profile_in_path(path, profile_name.as_deref())?);
+                }
+            }
+        }
+
+        // Surface the resolved profile/environment + automation.source for the
+        // summary. automation.source is informational only — not fetched.
+        self.active_profile = profile_name;
+        self.active_environment = environment_name;
+        self.automation_source = config.automation.as_ref().and_then(|a| a.source.clone());
+
+        // Each of playbook/inventory/roles is filled ONLY when the CLI left it
+        // unset — CLI wins over the contract. For the scalar playbook the
+        // "not set" guard is folded into the Option via `filter` (a single
+        // if-let, since `let`-chains are not stable); the lists are iterated
+        // unconditionally under their own is-empty guard.
+        if let Some(playbook) = defaults.playbook.as_ref().filter(|_| !self.playbook_set) {
+            self.append_playbook(
+                &resolve_repo_relative_path(&automation_root, playbook)?
+                    .display()
+                    .to_string(),
+            )?;
+        }
+
+        if self.role_paths.read().unwrap().is_empty() {
+            for roles in &defaults.roles {
+                self.append_roles(
+                    &resolve_repo_relative_path(&automation_root, roles)?
+                        .display()
+                        .to_string(),
+                )?;
+            }
+        }
+
+        if !self.inventory_set {
+            for inventory in &defaults.inventory {
+                self.append_inventory(
+                    &resolve_repo_relative_path(&automation_root, inventory)?
+                        .display()
+                        .to_string(),
+                )?;
+            }
+        }
+
+        // Secrets overlay (defaults.secrets_inventory) — only when --no-secrets
+        // was not passed. Loaded after the main inventory so it layers on top.
+        // #55: a declared path missing on disk (fresh clone / CI / contributor
+        // without the secrets sibling) is mode-aware — a converging run needs
+        // the operator truth and hard-errors; a non-mutating run (check/plan/
+        // syntax/...) warns and skips so static validation still works.
+        if !self.no_secrets {
+            for secrets in &defaults.secrets_inventory {
+                let resolved = resolve_repo_relative_path(&automation_root, secrets)?;
+                if resolved.exists() {
+                    self.append_secrets(&resolved.display().to_string())?;
+                } else if is_converging_mode(self.mode) {
+                    return Err(format!(
+                        "secrets_inventory path ({}) was not found. This run converges hosts \
+                         and needs the operator secrets — create/populate that folder, pass \
+                         --no-secrets to skip the overlay, or supply it via -i.",
+                        resolved.display()
+                    ));
+                } else {
+                    self.missing_secrets.write().unwrap().push(resolved);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Local-mode convention fallbacks (the `deploy/` layout) — the last-resort
+    /// layer BENEATH the contract. The `.jetpack` contract was already applied by
+    /// `apply_file_defaults`; this only fills what is still unset for a bare
+    /// `jetp local` with no contract and no explicit flags.
+    fn apply_local_bootstrap_defaults(&mut self, cwd: &Path) -> Result<(), String> {
         match self.mode {
             CLI_MODE_LOCAL | CLI_MODE_CHECK_LOCAL => {}
             _ => return Ok(()),
         }
 
-        let cwd = fs::canonicalize(env::current_dir().map_err(|e| e.to_string())?)
-            .map_err(|e| format!("failed to canonicalize current directory: {e}"))?;
-
-        let file_config = self.load_jetpack_file_config(&cwd)?;
-        let local_config = file_config.local.unwrap_or_default();
-
         if !self.playbook_set {
-            if let Some(playbook) = local_config.playbook.as_ref() {
-                self.append_playbook(
-                    &resolve_repo_relative_path(&cwd, playbook)?
-                        .display()
-                        .to_string(),
-                )?;
-            } else {
-                let default_playbook = cwd.join(DEFAULT_LOCAL_PLAYBOOK);
-                if default_playbook.is_file() {
-                    self.append_playbook(&default_playbook.display().to_string())?;
-                }
+            let default_playbook = cwd.join(DEFAULT_LOCAL_PLAYBOOK);
+            if default_playbook.is_file() {
+                self.append_playbook(&default_playbook.display().to_string())?;
             }
         }
 
         if self.playbook_set && self.role_paths.read().unwrap().is_empty() {
-            if let Some(roles) = local_config.roles.as_ref() {
-                self.append_roles(
-                    &resolve_repo_relative_path(&cwd, roles)?
-                        .display()
-                        .to_string(),
-                )?;
-            } else {
-                let default_roles = cwd.join(DEFAULT_LOCAL_ROLES);
-                if default_roles.is_dir() {
-                    self.append_roles(&default_roles.display().to_string())?;
-                }
+            let default_roles = cwd.join(DEFAULT_LOCAL_ROLES);
+            if default_roles.is_dir() {
+                self.append_roles(&default_roles.display().to_string())?;
             }
         }
 
         if !self.inventory_set {
-            if let Some(inventory) = local_config.inventory.as_ref() {
-                self.append_inventory(
-                    &resolve_repo_relative_path(&cwd, inventory)?
-                        .display()
-                        .to_string(),
-                )?;
-            } else {
-                let default_inventory = cwd.join(DEFAULT_LOCAL_INVENTORY);
-                if default_inventory.exists() {
-                    self.append_inventory(&default_inventory.display().to_string())?;
-                }
+            let default_inventory = cwd.join(DEFAULT_LOCAL_INVENTORY);
+            if default_inventory.exists() {
+                self.append_inventory(&default_inventory.display().to_string())?;
             }
         }
 
-        self.inject_local_builtins(&cwd)?;
         Ok(())
     }
 
+    /// The resolved run configuration as `(field, value)` rows for the
+    /// resolution summary. Built from post-parse state, so it reflects CLI
+    /// flags, the `.jetpack` contract, and conventions all merged together.
+    pub fn resolution_summary(&self) -> Vec<(String, String)> {
+        let secrets = if self.no_secrets {
+            String::from("(skipped via --no-secrets)")
+        } else {
+            let present = join_paths(&self.secrets_paths);
+            let missing = self.missing_secrets.read().unwrap();
+            if missing.is_empty() {
+                present
+            } else {
+                let missing_str = missing
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if present == "(none)" {
+                    format!("(missing: {} — skipped)", missing_str)
+                } else {
+                    format!("{} (missing: {} — skipped)", present, missing_str)
+                }
+            }
+        };
+        let mut rows = vec![
+            (
+                String::from("Automation root"),
+                self.automation_root.display().to_string(),
+            ),
+            (String::from("Playbook"), join_paths(&self.playbook_paths)),
+            (String::from("Inventory"), join_paths(&self.inventory_paths)),
+            (String::from("Secrets"), secrets),
+        ];
+        if let Some(profile) = &self.active_profile {
+            rows.push((String::from("Profile"), profile.clone()));
+        }
+        if let Some(environment) = &self.active_environment {
+            rows.push((String::from("Environment"), environment.clone()));
+        }
+        rows.push((String::from("Roles"), join_paths(&self.role_paths)));
+        if let Some(source) = &self.automation_source {
+            // Informational: parsed but not yet fetched.
+            rows.push((
+                String::from("Automation source"),
+                format!("{source} (fetch not yet implemented)"),
+            ));
+        }
+        rows.push((String::from("Mode"), cli_mode_name(self.mode).to_string()));
+        rows
+    }
+
     fn load_jetpack_file_config(&self, cwd: &Path) -> Result<JetpackFileConfig, String> {
-        let config_path = cwd.join(".jetpack.yml");
+        let Some(config_path) = config_file::locate_config(cwd, self.config_path.as_deref()) else {
+            // No .jetpack.yml found — fall back to the contrib/jetpack/ tree
+            // convention (a vendored automation namespace) before giving up.
+            if let Some(synth) = synth_contrib_defaults(&self.automation_root) {
+                return Ok(synth);
+            }
+            return Ok(JetpackFileConfig::default());
+        };
         if !config_path.is_file() {
+            return Err(format!(
+                "configuration file not found: {}",
+                config_path.display()
+            ));
+        }
+
+        // An empty/whitespace-only file is a valid marker-only contract — no
+        // defaults, just "this is the automation root". serde_yaml rejects an
+        // empty document when deserializing a struct, so handle it up front.
+        let raw = read_local_file(&config_path)?;
+        if raw.trim().is_empty() {
             return Ok(JetpackFileConfig::default());
         }
 
-        let config_file = jet_file_open(&config_path)?;
-        let parsed: Result<JetpackFileConfig, serde_yaml::Error> =
-            serde_yaml::from_reader(config_file);
+        // Phase 1 — schema-version gate: read the version leniently, then reject
+        // unknown future schemas BEFORE the strict body parse, so a version-2 file
+        // carrying as-yet-unknown keys fails with "upgrade Jetpack" rather than
+        // tripping `deny_unknown_fields` on a key it doesn't know about yet.
+        let version = config_file::probe_version(&raw).map_err(|err| {
+            show_yaml_error_in_context(&err, &config_path);
+            format!("invalid configuration: {}", config_path.display())
+        })?;
+        config_file::validate_version(version)?;
+
+        // Phase 2 — strict within-version parse: `deny_unknown_fields` catches
+        // typos against the pinned schema.
+        let parsed = config_file::deserialize(&raw);
         if let Err(err) = parsed.as_ref() {
             show_yaml_error_in_context(err, &config_path);
         }
-        parsed.map_err(|_| format!("invalid .jetpack.yml: {}", config_path.display()))
+        parsed.map_err(|_| format!("invalid configuration: {}", config_path.display()))
     }
 
-    fn inject_local_builtins(&mut self, cwd: &Path) -> Result<(), String> {
-        let repo_root = cwd;
+    fn inject_builtin_vars(&mut self, cwd: &Path, automation_root: &Path) -> Result<(), String> {
         let playbook_dir = self
             .playbook_paths
             .read()
@@ -1048,8 +1527,8 @@ impl CliParser {
             serde_yaml::Value::String(cwd.display().to_string()),
         );
         builtins.insert(
-            serde_yaml::Value::String("JET_REPO_ROOT".to_string()),
-            serde_yaml::Value::String(repo_root.display().to_string()),
+            serde_yaml::Value::String("JET_AUTOMATION_ROOT".to_string()),
+            serde_yaml::Value::String(automation_root.display().to_string()),
         );
         builtins.insert(
             serde_yaml::Value::String("JET_PLAYBOOK_DIR".to_string()),
@@ -1138,16 +1617,15 @@ impl CliParser {
                 }
             };
             blend_variables(&mut self.extra_vars, serde_yaml::Value::Mapping(parsed));
-        } else {
+        } else if let Ok(actual) = serde_json::from_str::<serde_json::Value>(value) {
             // input is inline JSON (as YAML wouldn't make sense with the newlines)
-
-            let parsed: Result<serde_json::Value, serde_json::Error> = serde_json::from_str(value);
-            let actual = match parsed {
-                Ok(x) => x,
-                Err(y) => return Err(format!("inline json is not valid: {}", y)),
-            };
             let serde_map = convert_json_vars(&actual);
             blend_variables(&mut self.extra_vars, serde_yaml::Value::Mapping(serde_map));
+        } else {
+            // key=value, dotted key → nested: the convenient form, e.g.
+            // `-e provision.state=destroyed` (use JSON for typed values).
+            let mapping = extra_vars_from_key_value(value)?;
+            blend_variables(&mut self.extra_vars, serde_yaml::Value::Mapping(mapping));
         }
 
         Ok(())
@@ -1206,23 +1684,73 @@ impl CliParser {
     }
 }
 
-fn resolve_repo_relative_path(repo_root: &Path, value: &str) -> Result<PathBuf, String> {
+fn resolve_repo_relative_path(automation_root: &Path, value: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(value);
     if candidate.is_absolute() {
         return Ok(candidate);
     }
-    Ok(repo_root.join(candidate))
+    Ok(automation_root.join(candidate))
+}
+
+/// When no `.jetpack.yml` exists, synthesize a contract from a `contrib/jetpack/`
+/// convention tree under the automation root — the documented namespace for
+/// vendored in-tree automation (kept apart from a project's own `playbooks/`/
+/// `roles/`). The documented entry is `contrib/jetpack/playbooks/install.yml`
+/// (falling back to `main.yml`/`main.yaml`), with `contrib/jetpack/roles` and
+/// `contrib/jetpack/inventory/example` added when present. Returns `None` when
+/// there is no usable tree (caller then has no contract).
+fn synth_contrib_defaults(automation_root: &Path) -> Option<JetpackFileConfig> {
+    let contrib = automation_root.join("contrib").join("jetpack");
+    let playbooks_dir = contrib.join("playbooks");
+    if !playbooks_dir.is_dir() {
+        return None;
+    }
+    let entry = ["install.yml", "main.yml", "main.yaml"]
+        .iter()
+        .map(|name| playbooks_dir.join(name))
+        .find(|p| p.is_file())?;
+    let playbook = entry
+        .strip_prefix(automation_root)
+        .unwrap_or(&entry)
+        .to_string_lossy()
+        .to_string();
+
+    let mut defaults = config_file::JetpackDefaults {
+        playbook: Some(playbook),
+        ..Default::default()
+    };
+    if contrib.join("roles").is_dir() {
+        defaults.roles = Some(vec!["contrib/jetpack/roles".to_string()]);
+    }
+    if contrib.join("inventory").join("example").exists() {
+        defaults.inventory = Some(vec!["contrib/jetpack/inventory/example".to_string()]);
+    }
+    Some(JetpackFileConfig {
+        defaults: Some(defaults),
+        ..Default::default()
+    })
+}
+
+/// Render the paths in a shared path-list as a comma-separated string, or
+/// "(none)" when empty — used by the resolution summary.
+fn join_paths(paths: &Arc<RwLock<Vec<PathBuf>>>) -> String {
+    let guard = paths.read().unwrap();
+    if guard.is_empty() {
+        return String::from("(none)");
+    }
+    guard
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use std::env;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    // Env-var-sensitive tests must hold this lock to prevent race conditions
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_cli_mode_from_string() {
@@ -1270,6 +1798,29 @@ mod tests {
             cli_mode_from_string(&"docs".to_string()).unwrap(),
             CLI_MODE_DOCS
         );
+        assert_eq!(
+            cli_mode_from_string(&"install".to_string()).unwrap(),
+            CLI_MODE_INSTALL
+        );
+
+        // #49 verb family — the intent-named verbs (apply/run/plan/check).
+        assert_eq!(
+            cli_mode_from_string(&"apply".to_string()).unwrap(),
+            CLI_MODE_APPLY
+        );
+        assert_eq!(
+            cli_mode_from_string(&"run".to_string()).unwrap(),
+            CLI_MODE_RUN
+        );
+        assert_eq!(
+            cli_mode_from_string(&"plan".to_string()).unwrap(),
+            CLI_MODE_PLAN
+        );
+        // `check` aliases `full-check` (validate playbook + inventory).
+        assert_eq!(
+            cli_mode_from_string(&"check".to_string()).unwrap(),
+            CLI_MODE_FULL_CHECK
+        );
 
         assert!(cli_mode_from_string(&"invalid".to_string()).is_err());
     }
@@ -1287,9 +1838,31 @@ mod tests {
         assert!(is_cli_mode_valid(&"inventory-check".to_string()));
         assert!(is_cli_mode_valid(&"full-check".to_string()));
         assert!(is_cli_mode_valid(&"docs".to_string()));
+        assert!(is_cli_mode_valid(&"install".to_string()));
+
+        // #49 verb family — the intent-named verbs are valid modes.
+        assert!(is_cli_mode_valid(&"apply".to_string()));
+        assert!(is_cli_mode_valid(&"run".to_string()));
+        assert!(is_cli_mode_valid(&"plan".to_string()));
+        assert!(is_cli_mode_valid(&"check".to_string()));
 
         assert!(!is_cli_mode_valid(&"invalid".to_string()));
         assert!(!is_cli_mode_valid(&"".to_string()));
+    }
+
+    #[test]
+    fn invalid_mode_error_lists_the_valid_modes() {
+        // An unknown verb should echo the bad input AND list the canonical modes
+        // so the user can self-correct without digging through --help.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut parser = CliParser::new();
+        let err = parser
+            .parse_from_strings(vec!["jetp".into(), "bogus".into()])
+            .unwrap_err();
+        assert!(err.contains("bogus"), "echoes the bad mode: {err}");
+        assert!(err.contains("apply"), "lists apply: {err}");
+        assert!(err.contains("plan"), "lists plan: {err}");
+        assert!(err.contains("local"), "lists local: {err}");
     }
 
     #[test]
@@ -1509,14 +2082,18 @@ mod tests {
     fn test_local_mode_infers_convention_paths_from_cwd() {
         let _lock = ENV_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
-        let repo_root = temp_dir.path();
-        fs::create_dir_all(repo_root.join("deploy/playbooks")).unwrap();
-        fs::create_dir_all(repo_root.join("deploy/roles")).unwrap();
-        fs::create_dir_all(repo_root.join("deploy/inventory")).unwrap();
-        fs::write(repo_root.join("deploy/playbooks/bootstrap.yml"), "---\n").unwrap();
+        let automation_root = temp_dir.path();
+        fs::create_dir_all(automation_root.join("deploy/playbooks")).unwrap();
+        fs::create_dir_all(automation_root.join("deploy/roles")).unwrap();
+        fs::create_dir_all(automation_root.join("deploy/inventory")).unwrap();
+        fs::write(
+            automation_root.join("deploy/playbooks/bootstrap.yml"),
+            "---\n",
+        )
+        .unwrap();
 
         let previous_dir = env::current_dir().unwrap();
-        env::set_current_dir(repo_root).unwrap();
+        env::set_current_dir(automation_root).unwrap();
 
         let mut parser = CliParser::new();
         let result = parser.parse_from_strings(vec!["jetp".into(), "local".into()]);
@@ -1531,11 +2108,55 @@ mod tests {
         let extra = parser.extra_vars.as_mapping().unwrap();
         assert_eq!(
             extra
-                .get(serde_yaml::Value::String("JET_REPO_ROOT".into()))
+                .get(serde_yaml::Value::String("JET_AUTOMATION_ROOT".into()))
                 .unwrap()
                 .as_str()
                 .unwrap(),
-            repo_root.canonicalize().unwrap().display().to_string()
+            automation_root
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn test_non_local_mode_injects_jet_automation_root() {
+        // JET_AUTOMATION_ROOT (and the other JET_* builtins) must be available in
+        // ssh mode too — not just local — so templates and generators anchored
+        // to the repo root work regardless of execution mode.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let automation_root = temp_dir.path();
+        fs::write(automation_root.join("play.yml"), "---\n").unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(automation_root).unwrap();
+
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec![
+            "jetp".into(),
+            "ssh".into(),
+            "--playbook".into(),
+            "play.yml".into(),
+        ]);
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        assert!(result.is_ok());
+        let extra = parser.extra_vars.as_mapping().unwrap();
+        let injected = extra
+            .get(serde_yaml::Value::String("JET_AUTOMATION_ROOT".into()))
+            .expect("JET_AUTOMATION_ROOT must be injected in ssh mode")
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            injected,
+            automation_root
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
         );
     }
 
@@ -1543,15 +2164,15 @@ mod tests {
     fn test_local_mode_uses_jetpack_yml_overrides() {
         let _lock = ENV_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
-        let repo_root = temp_dir.path();
-        fs::create_dir_all(repo_root.join("custom/pb")).unwrap();
-        fs::create_dir_all(repo_root.join("custom/roles")).unwrap();
-        fs::create_dir_all(repo_root.join("custom/inventory")).unwrap();
-        fs::write(repo_root.join("custom/pb/install.yml"), "---\n").unwrap();
-        fs::write(repo_root.join(".jetpack.yml"), "local:\n  playbook: custom/pb/install.yml\n  roles: custom/roles\n  inventory: custom/inventory\n").unwrap();
+        let automation_root = temp_dir.path();
+        fs::create_dir_all(automation_root.join("custom/pb")).unwrap();
+        fs::create_dir_all(automation_root.join("custom/roles")).unwrap();
+        fs::create_dir_all(automation_root.join("custom/inventory")).unwrap();
+        fs::write(automation_root.join("custom/pb/install.yml"), "---\n").unwrap();
+        fs::write(automation_root.join(".jetpack.yml"), "local:\n  playbook: custom/pb/install.yml\n  roles: custom/roles\n  inventory: custom/inventory\n").unwrap();
 
         let previous_dir = env::current_dir().unwrap();
-        env::set_current_dir(repo_root).unwrap();
+        env::set_current_dir(automation_root).unwrap();
 
         let mut parser = CliParser::new();
         let result = parser.parse_from_strings(vec!["jetp".into(), "local".into()]);
@@ -1583,16 +2204,20 @@ mod tests {
     fn test_cli_flags_override_local_defaults() {
         let _lock = ENV_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
-        let repo_root = temp_dir.path();
-        fs::create_dir_all(repo_root.join("deploy/playbooks")).unwrap();
-        fs::create_dir_all(repo_root.join("deploy/roles")).unwrap();
-        fs::create_dir_all(repo_root.join("deploy/inventory")).unwrap();
-        fs::create_dir_all(repo_root.join("manual")).unwrap();
-        fs::write(repo_root.join("deploy/playbooks/bootstrap.yml"), "---\n").unwrap();
-        fs::write(repo_root.join("manual/explicit.yml"), "---\n").unwrap();
+        let automation_root = temp_dir.path();
+        fs::create_dir_all(automation_root.join("deploy/playbooks")).unwrap();
+        fs::create_dir_all(automation_root.join("deploy/roles")).unwrap();
+        fs::create_dir_all(automation_root.join("deploy/inventory")).unwrap();
+        fs::create_dir_all(automation_root.join("manual")).unwrap();
+        fs::write(
+            automation_root.join("deploy/playbooks/bootstrap.yml"),
+            "---\n",
+        )
+        .unwrap();
+        fs::write(automation_root.join("manual/explicit.yml"), "---\n").unwrap();
 
         let previous_dir = env::current_dir().unwrap();
-        env::set_current_dir(repo_root).unwrap();
+        env::set_current_dir(automation_root).unwrap();
 
         let mut parser = CliParser::new();
         let result = parser.parse_from_strings(vec![
@@ -1613,6 +2238,1222 @@ mod tests {
             .unwrap()
             .clone();
         assert!(playbook.ends_with("manual/explicit.yml"));
+    }
+
+    #[test]
+    fn load_rejects_future_schema_before_unknown_field_errors() {
+        // A version-2 contract carrying an as-yet-unknown `profiles:` key must be
+        // rejected by the schema-version gate ("upgrade Jetpack") — NOT by
+        // deny_unknown_fields choking on `profiles`. This is the contract-vs-
+        // config distinction: the version gates the body parse.
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join(".jetpack.yml"),
+            "version: 2\nprofiles:\n  - prod\n",
+        )
+        .unwrap();
+
+        let parser = CliParser::new();
+        let err = parser
+            .load_jetpack_file_config(temp_dir.path())
+            .unwrap_err();
+        assert!(err.contains("version 2"), "gate names the version: {err}");
+        assert!(
+            err.contains("Upgrade Jetpack"),
+            "gate points to upgrade: {err}"
+        );
+        assert!(
+            !err.contains("unknown field"),
+            "must not surface a deny_unknown_fields error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_flag_is_authoritative_over_auto_discovery() {
+        let temp_dir = TempDir::new().unwrap();
+        // an auto-discoverable contract that would load fine on its own
+        fs::write(temp_dir.path().join(".jetpack.yml"), "version: 1\n").unwrap();
+        // --config points elsewhere (missing) → authoritative, so it surfaces a
+        // clear "not found" rather than silently falling back to discovery
+        let explicit = temp_dir.path().join("explicit.yml");
+        let mut parser = CliParser::new();
+        parser.config_path = Some(explicit.clone());
+
+        let err = parser
+            .load_jetpack_file_config(temp_dir.path())
+            .unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn load_treats_empty_contract_as_marker_only() {
+        // a zero-byte contract is a valid marker-only file → empty defaults, no
+        // serde error from deserializing an empty document
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".jetpack.yml"), "").unwrap();
+
+        let parser = CliParser::new();
+        let config = parser
+            .load_jetpack_file_config(temp_dir.path())
+            .expect("empty contract is valid");
+        assert_eq!(
+            config.effective(),
+            config_file::EffectiveDefaults::default()
+        );
+    }
+
+    #[test]
+    fn resolve_playbook_path_file_is_used_directly() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("x.yml");
+        fs::write(&file, "---\n").unwrap();
+        assert_eq!(resolve_playbook_path(&file).unwrap(), file);
+    }
+
+    #[test]
+    fn resolve_playbook_path_dir_prefers_main_yml() {
+        let dir = TempDir::new().unwrap();
+        let pb = dir.path().join("web");
+        fs::create_dir_all(&pb).unwrap();
+        fs::write(pb.join("main.yml"), "---\n").unwrap();
+        fs::write(pb.join("web.yml"), "---\n").unwrap();
+        assert_eq!(resolve_playbook_path(&pb).unwrap(), pb.join("main.yml"));
+    }
+
+    #[test]
+    fn resolve_playbook_path_dir_falls_back_to_main_yaml() {
+        let dir = TempDir::new().unwrap();
+        let pb = dir.path().join("web");
+        fs::create_dir_all(&pb).unwrap();
+        fs::write(pb.join("main.yaml"), "---\n").unwrap();
+        assert_eq!(resolve_playbook_path(&pb).unwrap(), pb.join("main.yaml"));
+    }
+
+    #[test]
+    fn resolve_playbook_path_dir_uses_namesake_yml() {
+        let dir = TempDir::new().unwrap();
+        let pb = dir.path().join("gravity");
+        fs::create_dir_all(&pb).unwrap();
+        fs::write(pb.join("gravity.yml"), "---\n").unwrap();
+        assert_eq!(resolve_playbook_path(&pb).unwrap(), pb.join("gravity.yml"));
+    }
+
+    #[test]
+    fn resolve_playbook_path_dir_uses_namesake_yaml() {
+        let dir = TempDir::new().unwrap();
+        let pb = dir.path().join("gravity");
+        fs::create_dir_all(&pb).unwrap();
+        fs::write(pb.join("gravity.yaml"), "---\n").unwrap();
+        assert_eq!(resolve_playbook_path(&pb).unwrap(), pb.join("gravity.yaml"));
+    }
+
+    #[test]
+    fn resolve_playbook_path_dir_with_no_entry_errors_clearly() {
+        let dir = TempDir::new().unwrap();
+        let pb = dir.path().join("empty");
+        fs::create_dir_all(&pb).unwrap();
+        let err = resolve_playbook_path(&pb).unwrap_err();
+        assert!(err.contains("no playbook entry"), "{err}");
+        assert!(err.contains("main.yml"), "{err}");
+        assert!(err.contains("empty.yml"), "{err}");
+    }
+
+    #[test]
+    fn playbook_dir_arg_resolves_to_namesake_and_sets_playbook_dir() {
+        // `-p <dir>` resolves to the dir's entry, and JET_PLAYBOOK_DIR becomes the
+        // directory the user pointed at (so modules/roles siblings auto-discover).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let automation_root = temp_dir.path();
+        let pb_dir = automation_root.join("playbooks").join("gravity");
+        fs::create_dir_all(&pb_dir).unwrap();
+        fs::write(pb_dir.join("gravity.yml"), "---\n").unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(automation_root).unwrap();
+
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec![
+            "jetp".into(),
+            "ssh".into(),
+            "--playbook".into(),
+            "playbooks/gravity".into(),
+        ]);
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        let playbook = parser
+            .playbook_paths
+            .read()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        assert!(playbook.ends_with("playbooks/gravity/gravity.yml"));
+        let extra = parser.extra_vars.as_mapping().unwrap();
+        let playbook_dir = extra
+            .get(serde_yaml::Value::String("JET_PLAYBOOK_DIR".into()))
+            .expect("JET_PLAYBOOK_DIR injected")
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            playbook_dir.ends_with("playbooks/gravity"),
+            "JET_PLAYBOOK_DIR should be the dir pointed at: {playbook_dir}"
+        );
+    }
+
+    #[test]
+    fn zero_arg_ssh_uses_contract_defaults() {
+        // The headline of #47: with a `.jetpack` contract, `jetp ssh` (zero args)
+        // resolves playbook + inventory and flips the required-arg gates.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let automation_root = temp_dir.path();
+        fs::create_dir_all(automation_root.join("pb")).unwrap();
+        fs::create_dir_all(automation_root.join("inv")).unwrap();
+        fs::write(automation_root.join("pb/install.yml"), "---\n").unwrap();
+        fs::write(
+            automation_root.join(".jetpack.yml"),
+            "version: 1\ndefaults:\n  playbook: pb/install.yml\n  inventory:\n    - inv\n",
+        )
+        .unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(automation_root).unwrap();
+
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec!["jetp".into(), "ssh".into()]);
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(parser.playbook_set, "playbook defaulted from contract");
+        assert!(parser.inventory_set, "inventory defaulted from contract");
+        let playbook = parser
+            .playbook_paths
+            .read()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        assert!(playbook.ends_with("pb/install.yml"));
+        let inventory = parser
+            .inventory_paths
+            .read()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        assert!(inventory.ends_with("inv"));
+    }
+
+    #[test]
+    fn cli_flags_override_contract_defaults() {
+        // Precedence is CLI > file > convention: an explicit -p beats the
+        // contract's defaults.playbook.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let automation_root = temp_dir.path();
+        fs::create_dir_all(automation_root.join("pb")).unwrap();
+        fs::create_dir_all(automation_root.join("manual")).unwrap();
+        fs::write(automation_root.join("pb/contract.yml"), "---\n").unwrap();
+        fs::write(automation_root.join("manual/explicit.yml"), "---\n").unwrap();
+        fs::write(
+            automation_root.join(".jetpack.yml"),
+            "version: 1\ndefaults:\n  playbook: pb/contract.yml\n",
+        )
+        .unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(automation_root).unwrap();
+
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec![
+            "jetp".into(),
+            "ssh".into(),
+            "--playbook".into(),
+            "manual/explicit.yml".into(),
+        ]);
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        assert!(result.is_ok());
+        let playbook = parser
+            .playbook_paths
+            .read()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        assert!(
+            playbook.ends_with("manual/explicit.yml"),
+            "CLI -p must beat the contract: {playbook:?}"
+        );
+    }
+
+    #[test]
+    fn contract_paths_resolve_against_automation_root_from_subdir() {
+        // Running from a subdirectory, the contract's relative paths resolve
+        // against the automation root (like Cargo.toml), not the working dir.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let automation_root = temp_dir.path();
+        fs::create_dir_all(automation_root.join("pb")).unwrap();
+        fs::write(automation_root.join("pb/install.yml"), "---\n").unwrap();
+        fs::write(
+            automation_root.join(".jetpack.yml"),
+            "version: 1\ndefaults:\n  playbook: pb/install.yml\n",
+        )
+        .unwrap();
+        let subdir = automation_root.join("deep").join("nest");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(&subdir).unwrap();
+
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec!["jetp".into(), "ssh".into()]);
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        assert!(result.is_ok());
+        let playbook = parser
+            .playbook_paths
+            .read()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        assert!(playbook.ends_with("pb/install.yml"));
+    }
+
+    #[test]
+    fn contract_secrets_inventory_defaults_into_secrets_paths() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("pb")).unwrap();
+        fs::create_dir_all(root.join("inv")).unwrap();
+        fs::create_dir_all(root.join("secrets")).unwrap();
+        fs::write(root.join("pb/install.yml"), "---\n").unwrap();
+        fs::write(
+            root.join(".jetpack.yml"),
+            "version: 1\ndefaults:\n  playbook: pb/install.yml\n  inventory:\n    - inv\n  \
+             secrets_inventory:\n    - secrets\n",
+        )
+        .unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec!["jetp".into(), "apply".into()]);
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        let secrets = parser.secrets_paths.read().unwrap().clone();
+        assert_eq!(
+            secrets.len(),
+            1,
+            "secrets_inventory defaulted from contract"
+        );
+        assert!(secrets[0].ends_with("secrets"));
+    }
+
+    #[test]
+    fn no_secrets_flag_skips_the_secrets_inventory_overlay() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("pb")).unwrap();
+        fs::create_dir_all(root.join("inv")).unwrap();
+        fs::create_dir_all(root.join("secrets")).unwrap();
+        fs::write(root.join("pb/install.yml"), "---\n").unwrap();
+        fs::write(
+            root.join(".jetpack.yml"),
+            "version: 1\ndefaults:\n  playbook: pb/install.yml\n  inventory:\n    - inv\n  \
+             secrets_inventory:\n    - secrets\n",
+        )
+        .unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+
+        let mut parser = CliParser::new();
+        let result =
+            parser.parse_from_strings(vec!["jetp".into(), "apply".into(), "--no-secrets".into()]);
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(parser.no_secrets);
+        assert!(
+            parser.secrets_paths.read().unwrap().is_empty(),
+            "--no-secrets must not populate secrets_paths"
+        );
+    }
+
+    // --- #55: mode-aware missing-secrets gate ---
+
+    /// Fixture: a `.jetpack.yml` with playbook + inventory, and
+    /// `secrets_inventory` pointing at `../missing-secrets` (NOT on disk) when
+    /// `declare_secrets` is true. Returns the kept-alive TempDir + its root.
+    fn secrets_contract_fixture(declare_secrets: bool) -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        fs::create_dir_all(root.join("pb")).unwrap();
+        fs::create_dir_all(root.join("inv")).unwrap();
+        fs::write(root.join("pb/install.yml"), "---\n").unwrap();
+        let secrets_line = if declare_secrets {
+            "  secrets_inventory:\n    - ../missing-secrets\n"
+        } else {
+            ""
+        };
+        fs::write(
+            root.join(".jetpack.yml"),
+            format!(
+                "version: 1\ndefaults:\n  playbook: pb/install.yml\n  inventory:\n    - inv\n{}",
+                secrets_line
+            ),
+        )
+        .unwrap();
+        (temp_dir, root)
+    }
+
+    #[test]
+    fn missing_secrets_warns_and_skips_in_non_mutating_mode() {
+        // `check` is non-mutating: a declared-but-missing secrets path must be
+        // warned + skipped, NOT hard-fail (#55 — fresh clone / CI / contributor).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_temp, root) = secrets_contract_fixture(true);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&root).unwrap();
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec!["jetp".into(), "check".into()]);
+        env::set_current_dir(previous).unwrap();
+
+        assert!(
+            result.is_ok(),
+            "check must not hard-fail on missing secrets: {:?}",
+            result.err()
+        );
+        assert!(
+            parser.secrets_paths.read().unwrap().is_empty(),
+            "missing secret must not be loaded"
+        );
+        let missing = parser.missing_secrets.read().unwrap();
+        assert_eq!(missing.len(), 1, "missing secret recorded: {:?}", missing);
+        assert!(missing[0].to_string_lossy().ends_with("missing-secrets"));
+    }
+
+    #[test]
+    fn missing_secrets_hard_errors_in_converging_mode() {
+        // `apply` converges hosts: a declared-but-missing secrets path must
+        // hard-error with an actionable message naming the path + the override.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_temp, root) = secrets_contract_fixture(true);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&root).unwrap();
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec!["jetp".into(), "apply".into()]);
+        env::set_current_dir(previous).unwrap();
+
+        let err = result
+            .err()
+            .expect("apply must hard-fail on missing secrets");
+        assert!(err.contains("secrets_inventory"), "names the key: {}", err);
+        assert!(err.contains("missing-secrets"), "names the path: {}", err);
+        assert!(
+            err.contains("--no-secrets"),
+            "explains the override: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn undeclared_secrets_is_unchanged_in_any_mode() {
+        // No `secrets_inventory` key → no gate, no warning, regardless of mode.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_temp, root) = secrets_contract_fixture(false);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&root).unwrap();
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec!["jetp".into(), "apply".into()]);
+        env::set_current_dir(previous).unwrap();
+        assert!(
+            result.is_ok(),
+            "no secrets key → no gate: {:?}",
+            result.err()
+        );
+        assert!(parser.missing_secrets.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_secrets_override_proceeds_with_missing_in_converging_mode() {
+        // `--no-secrets` is the explicit override even in a converging mode.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_temp, root) = secrets_contract_fixture(true);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&root).unwrap();
+        let mut parser = CliParser::new();
+        let result =
+            parser.parse_from_strings(vec!["jetp".into(), "apply".into(), "--no-secrets".into()]);
+        env::set_current_dir(previous).unwrap();
+        assert!(
+            result.is_ok(),
+            "--no-secrets overrides missing secrets: {:?}",
+            result.err()
+        );
+        assert!(
+            parser.missing_secrets.read().unwrap().is_empty(),
+            "nothing recorded under --no-secrets"
+        );
+    }
+
+    #[test]
+    fn resolution_summary_reflects_missing_secrets() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_temp, root) = secrets_contract_fixture(true);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&root).unwrap();
+        let mut parser = CliParser::new();
+        parser
+            .parse_from_strings(vec!["jetp".into(), "check".into()])
+            .unwrap();
+        env::set_current_dir(previous).unwrap();
+        let map: HashMap<String, String> = parser.resolution_summary().into_iter().collect();
+        assert!(
+            map["Secrets"].contains("missing"),
+            "summary shows missing: {}",
+            map["Secrets"]
+        );
+        assert!(
+            map["Secrets"].contains("skipped"),
+            "summary shows skipped: {}",
+            map["Secrets"]
+        );
+    }
+
+    #[test]
+    fn inventory_load_paths_appends_secrets_unless_no_secrets() {
+        let mut parser = CliParser::new();
+        parser
+            .inventory_paths
+            .write()
+            .unwrap()
+            .push(PathBuf::from("/main"));
+        parser
+            .secrets_paths
+            .write()
+            .unwrap()
+            .push(PathBuf::from("/secrets"));
+
+        let combined = parser.inventory_load_paths();
+        assert_eq!(
+            combined,
+            vec![PathBuf::from("/main"), PathBuf::from("/secrets")],
+            "secrets append after main for overlay ordering"
+        );
+
+        parser.no_secrets = true;
+        let combined = parser.inventory_load_paths();
+        assert_eq!(
+            combined,
+            vec![PathBuf::from("/main")],
+            "--no-secrets drops secrets from the load list"
+        );
+    }
+
+    // Set up a temp automation root with a `.jetpack.yml` and the inventory /
+    // secrets dirs the profile tests reference, run the given args, and return
+    // the parser + parse result. TempDir lives through parse (paths resolve),
+    // then drops; we only read stored PathBuf strings afterward.
+    fn parse_with_contract(contract: &str, args: &[&str]) -> (CliParser, Result<(), String>) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        for d in [
+            "pb",
+            "inv/default",
+            "inv/perth",
+            "inv/london",
+            "inv/nolondon",
+            "inv/dry",
+            "sec/default",
+            "sec/perth",
+            "sec/london",
+            "sec/london-test",
+            "sec/envtest",
+        ] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        fs::write(root.join("pb/install.yml"), "---\n").unwrap();
+        fs::write(root.join(".jetpack.yml"), contract).unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+        let mut parser = CliParser::new();
+        let mut full: Vec<String> = vec!["jetp".into()];
+        full.extend(args.iter().map(|s| s.to_string()));
+        let result = parser.parse_from_strings(full);
+        env::set_current_dir(previous_dir).unwrap();
+        (parser, result)
+    }
+
+    fn last_segment(paths: &Arc<RwLock<Vec<PathBuf>>>) -> Option<String> {
+        paths
+            .read()
+            .unwrap()
+            .last()
+            .map(|p| p.to_string_lossy().to_string())
+    }
+
+    fn has_segment(paths: &Arc<RwLock<Vec<PathBuf>>>, suffix: &str) -> bool {
+        paths
+            .read()
+            .unwrap()
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(suffix))
+    }
+
+    #[test]
+    fn profile_overrides_inventory_and_secrets() {
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  secrets_inventory: [sec/default]
+profiles:
+  perth:
+    inventory: [inv/perth]
+    secrets_inventory: [sec/perth]
+";
+        let (parser, result) = parse_with_contract(contract, &["apply", "--profile", "perth"]);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            last_segment(&parser.inventory_paths)
+                .unwrap()
+                .ends_with("inv/perth")
+        );
+        assert!(
+            last_segment(&parser.secrets_paths)
+                .unwrap()
+                .ends_with("sec/perth")
+        );
+    }
+
+    #[test]
+    fn defaults_profile_used_when_no_profile_flag() {
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  profile: london
+profiles:
+  london:
+    inventory: [inv/london]
+";
+        let (parser, result) = parse_with_contract(contract, &["apply"]);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            last_segment(&parser.inventory_paths)
+                .unwrap()
+                .ends_with("inv/london")
+        );
+    }
+
+    #[test]
+    fn unknown_profile_errors_clearly() {
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+profiles:
+  london:
+    inventory: [inv/london]
+";
+        let (_parser, result) = parse_with_contract(contract, &["apply", "--profile", "bogus"]);
+        let err = result.unwrap_err();
+        assert!(err.contains("profile 'bogus'"), "{err}");
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn profile_with_absent_key_inherits_defaults() {
+        // A profile that omits secrets_inventory inherits defaults.secrets_inventory.
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  secrets_inventory: [sec/default]
+profiles:
+  nolondon:
+    inventory: [inv/nolondon]
+";
+        let (parser, result) = parse_with_contract(contract, &["apply", "--profile", "nolondon"]);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            last_segment(&parser.inventory_paths)
+                .unwrap()
+                .ends_with("inv/nolondon")
+        );
+        assert!(
+            last_segment(&parser.secrets_paths)
+                .unwrap()
+                .ends_with("sec/default"),
+            "absent secrets_inventory key inherits defaults"
+        );
+    }
+
+    #[test]
+    fn profile_empty_secrets_clears_the_overlay() {
+        // A profile with secrets_inventory: [] clears secrets (distinct from absent).
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  secrets_inventory: [sec/default]
+profiles:
+  dry:
+    inventory: [inv/dry]
+    secrets_inventory: []
+";
+        let (parser, result) = parse_with_contract(contract, &["apply", "--profile", "dry"]);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            last_segment(&parser.inventory_paths)
+                .unwrap()
+                .ends_with("inv/dry")
+        );
+        assert!(
+            parser.secrets_paths.read().unwrap().is_empty(),
+            "secrets_inventory: [] clears the overlay"
+        );
+    }
+
+    #[test]
+    fn environment_appends_secrets_overlay_last() {
+        // The env overlay is appended after the base secrets (loaded last →
+        // later-wins), so both are present and the env one is last.
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  secrets_inventory: [sec/default]
+environments:
+  test:
+    secrets_inventory: [sec/envtest]
+";
+        let (parser, result) = parse_with_contract(contract, &["apply", "--environment", "test"]);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            has_segment(&parser.secrets_paths, "sec/default"),
+            "base secrets still present under an environment"
+        );
+        assert!(
+            last_segment(&parser.secrets_paths)
+                .unwrap()
+                .ends_with("sec/envtest"),
+            "environment overlay appended last (later-wins)"
+        );
+        assert_eq!(parser.active_environment.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn environment_short_alias_works() {
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  secrets_inventory: [sec/default]
+environments:
+  test:
+    secrets_inventory: [sec/envtest]
+";
+        let (parser, result) = parse_with_contract(contract, &["apply", "-E", "test"]);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            last_segment(&parser.secrets_paths)
+                .unwrap()
+                .ends_with("sec/envtest"),
+            "-E selects the environment like --environment"
+        );
+    }
+
+    #[test]
+    fn defaults_environment_used_when_no_flag() {
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  secrets_inventory: [sec/default]
+  environment: test
+environments:
+  test:
+    secrets_inventory: [sec/envtest]
+";
+        let (parser, result) = parse_with_contract(contract, &["apply"]);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            last_segment(&parser.secrets_paths)
+                .unwrap()
+                .ends_with("sec/envtest"),
+            "defaults.environment activates the overlay without --environment"
+        );
+    }
+
+    #[test]
+    fn environment_orthogonal_to_profile() {
+        // --profile selects inventory+secrets; --environment layers its overlay
+        // on top. Both the profile's secrets and the env overlay load.
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  secrets_inventory: [sec/default]
+profiles:
+  london:
+    inventory: [inv/london]
+    secrets_inventory: [sec/london]
+environments:
+  test:
+    secrets_inventory: [sec/envtest]
+";
+        let (parser, result) = parse_with_contract(
+            contract,
+            &["apply", "--profile", "london", "--environment", "test"],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            last_segment(&parser.inventory_paths)
+                .unwrap()
+                .ends_with("inv/london"),
+            "profile still drives inventory"
+        );
+        assert!(
+            has_segment(&parser.secrets_paths, "sec/london"),
+            "profile secrets present"
+        );
+        assert!(
+            last_segment(&parser.secrets_paths)
+                .unwrap()
+                .ends_with("sec/envtest"),
+            "environment overlay layered on top of the profile secrets"
+        );
+    }
+
+    #[test]
+    fn environment_secrets_profile_placeholder_resolves_to_active_profile() {
+        // `{profile}` in an environment's secrets_inventory resolves to the
+        // selected profile name, so one `test` env can layer <site>-test per
+        // site (london/nyc/seattle) without per-site environment entries.
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+profiles:
+  london:
+    inventory: [inv/london]
+environments:
+  test:
+    secrets_inventory:
+      - sec/{profile}-test
+";
+        let (parser, result) = parse_with_contract(
+            contract,
+            &["apply", "--profile", "london", "--environment", "test"],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            has_segment(&parser.secrets_paths, "sec/london-test"),
+            "`{{profile}}` resolved to the active profile name: {:?}",
+            parser.secrets_paths
+        );
+        // The resolved path is what the runtime will actually load.
+        let in_load_list = parser
+            .inventory_load_paths()
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("sec/london-test"));
+        assert!(in_load_list, "resolved overlay is in the load list");
+    }
+
+    #[test]
+    fn environment_secrets_profile_placeholder_without_profile_errors() {
+        // `{profile}` with no profile selected is a config error: the operator
+        // asked for a per-profile overlay but named no profile. Error clearly
+        // rather than silently substituting empty (which would load a bogus path).
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+environments:
+  test:
+    secrets_inventory:
+      - sec/{profile}-test
+";
+        let (_parser, result) = parse_with_contract(contract, &["apply", "--environment", "test"]);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("{profile}"),
+            "error names the placeholder: {err}"
+        );
+        assert!(err.contains("no profile"), "error states the cause: {err}");
+    }
+
+    #[test]
+    fn profile_secrets_profile_placeholder_self_substitutes() {
+        // `{profile}` in a profile's OWN secrets_inventory substitutes that
+        // profile's name — DRY across sites (one path shape, name self-fills).
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+profiles:
+  london:
+    inventory: [inv/london]
+    secrets_inventory:
+      - sec/{profile}-test
+";
+        let (parser, result) = parse_with_contract(contract, &["apply", "--profile", "london"]);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            has_segment(&parser.secrets_paths, "sec/london-test"),
+            "`{{profile}}` self-substituted the profile name: {:?}",
+            parser.secrets_paths
+        );
+    }
+
+    #[test]
+    fn unknown_environment_errors_clearly() {
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+environments:
+  test:
+    secrets_inventory: [sec/envtest]
+";
+        let (_parser, result) = parse_with_contract(contract, &["apply", "--environment", "bogus"]);
+        let err = result.unwrap_err();
+        assert!(err.contains("environment 'bogus'"), "{err}");
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn no_secrets_skips_the_environment_overlay() {
+        // --no-secrets skips the entire secrets machinery, including the env
+        // overlay — so an environment that would append is a no-op (and an
+        // unknown environment under --no-secrets does not error).
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+  secrets_inventory: [sec/default]
+environments:
+  test:
+    secrets_inventory: [sec/envtest]
+";
+        let (parser, result) = parse_with_contract(
+            contract,
+            &["apply", "--environment", "test", "--no-secrets"],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            parser.secrets_paths.read().unwrap().is_empty(),
+            "--no-secrets skips the environment overlay too"
+        );
+    }
+
+    #[test]
+    fn cli_inventory_flag_beats_profile() {
+        // CLI -i wins over the profile's inventory (precedence: CLI > profile).
+        let contract = "\
+version: 1
+defaults:
+  playbook: pb/install.yml
+  inventory: [inv/default]
+profiles:
+  perth:
+    inventory: [inv/perth]
+";
+        let (parser, result) = parse_with_contract(
+            contract,
+            &["apply", "--profile", "perth", "-i", "inv/london"],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            last_segment(&parser.inventory_paths)
+                .unwrap()
+                .ends_with("inv/london"),
+            "CLI -i must beat the profile"
+        );
+    }
+
+    #[test]
+    fn contrib_jetpack_discovered_when_no_contract() {
+        // No .jetpack.yml, but a contrib/jetpack/ tree with the documented
+        // install playbook → zero-arg `apply` resolves it as the default.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("contrib/jetpack/playbooks")).unwrap();
+        fs::create_dir_all(root.join("contrib/jetpack/roles")).unwrap();
+        fs::write(root.join("contrib/jetpack/playbooks/install.yml"), "---\n").unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+
+        let mut parser = CliParser::new();
+        let result = parser.parse_from_strings(vec!["jetp".into(), "apply".into()]);
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(parser.playbook_set, "contrib/jetpack playbook discovered");
+        let playbook = parser
+            .playbook_paths
+            .read()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap();
+        assert!(
+            playbook
+                .to_string_lossy()
+                .ends_with("contrib/jetpack/playbooks/install.yml")
+        );
+        assert!(
+            parser
+                .role_paths
+                .read()
+                .unwrap()
+                .iter()
+                .any(|r| r.to_string_lossy().ends_with("contrib/jetpack/roles")),
+            "contrib roles discovered"
+        );
+    }
+
+    #[test]
+    fn no_contract_and_no_contrib_yields_empty_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let mut parser = CliParser::new();
+        parser.automation_root = root.to_path_buf();
+        let cfg = parser.load_jetpack_file_config(root).unwrap();
+        assert_eq!(cfg, JetpackFileConfig::default());
+    }
+
+    #[test]
+    fn cli_mode_name_round_trips_known_modes() {
+        for &name in all_mode_names() {
+            let mode = cli_mode_from_string(name).unwrap();
+            assert_eq!(cli_mode_name(mode), name);
+        }
+        assert_eq!(cli_mode_name(CLI_MODE_UNSET), "unset");
+    }
+
+    #[test]
+    fn is_execution_mode_flags_only_run_modes() {
+        for mode in [
+            CLI_MODE_SSH,
+            CLI_MODE_CHECK_SSH,
+            CLI_MODE_LOCAL,
+            CLI_MODE_CHECK_LOCAL,
+            CLI_MODE_PULL,
+            CLI_MODE_SIMULATE,
+            CLI_MODE_APPLY,
+            CLI_MODE_RUN,
+            CLI_MODE_PLAN,
+        ] {
+            assert!(
+                is_execution_mode(mode),
+                "{mode} should be an execution mode"
+            );
+        }
+        for mode in [
+            CLI_MODE_SHOW,
+            CLI_MODE_SYNTAX,
+            CLI_MODE_INVENTORY_CHECK,
+            CLI_MODE_FULL_CHECK,
+            CLI_MODE_DOCS,
+            CLI_MODE_GEN_REFERENCE,
+            CLI_MODE_INSTALL,
+        ] {
+            assert!(
+                !is_execution_mode(mode),
+                "{mode} should NOT be an execution mode"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_run_plan_check_round_trip_through_canonical_names() {
+        // The intent-named verbs are the canonical, advertised set: each parses
+        // to its own constant, displays back under its own name, and appears in
+        // the docs reference list. `check` is the validate verb.
+        for (name, constant) in [
+            ("apply", CLI_MODE_APPLY),
+            ("run", CLI_MODE_RUN),
+            ("plan", CLI_MODE_PLAN),
+        ] {
+            assert_eq!(cli_mode_from_string(name).unwrap(), constant);
+            assert_eq!(cli_mode_name(constant), name);
+            assert!(
+                all_mode_names().contains(&name),
+                "{name} should be advertised in all_mode_names"
+            );
+        }
+        // The three new converge/dry-run verbs must be distinct constants, so a
+        // future divergence (e.g. run → ad-hoc exec) needs no rename.
+        assert_ne!(CLI_MODE_APPLY, CLI_MODE_RUN);
+        assert_ne!(CLI_MODE_APPLY, CLI_MODE_PLAN);
+        assert_ne!(CLI_MODE_RUN, CLI_MODE_PLAN);
+    }
+
+    #[test]
+    fn check_is_an_alias_of_full_check() {
+        // `check` is the validate verb — the canonical name for what `full-check`
+        // already did. Same constant, canonical display name "check".
+        assert_eq!(
+            cli_mode_from_string("check").unwrap(),
+            cli_mode_from_string("full-check").unwrap()
+        );
+        assert_eq!(cli_mode_from_string("check").unwrap(), CLI_MODE_FULL_CHECK);
+        assert_eq!(cli_mode_name(CLI_MODE_FULL_CHECK), "check");
+        assert!(all_mode_names().contains(&"check"));
+    }
+
+    #[test]
+    fn legacy_transport_verbs_still_parse_but_are_not_advertised() {
+        // The old transport-named verbs keep working (silent aliases, no
+        // deprecation warning in v1) but are NOT in the advertised canonical
+        // set, so the docs/help steer users to the intent-named verbs.
+        assert_eq!(cli_mode_from_string("ssh").unwrap(), CLI_MODE_SSH);
+        assert_eq!(
+            cli_mode_from_string("check-ssh").unwrap(),
+            CLI_MODE_CHECK_SSH
+        );
+        assert!(is_cli_mode_valid("ssh"));
+        assert!(is_cli_mode_valid("check-ssh"));
+        assert!(!all_mode_names().contains(&"ssh"));
+        assert!(!all_mode_names().contains(&"check-ssh"));
+        // `full-check` is also retired from the advertised set (canonical: check).
+        assert!(!all_mode_names().contains(&"full-check"));
+    }
+
+    #[test]
+    fn resolution_summary_reports_resolved_state() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let automation_root = temp_dir.path();
+        fs::write(automation_root.join("play.yml"), "---\n").unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(automation_root).unwrap();
+
+        let mut parser = CliParser::new();
+        parser
+            .parse_from_strings(vec![
+                "jetp".into(),
+                "ssh".into(),
+                "--playbook".into(),
+                "play.yml".into(),
+            ])
+            .unwrap();
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        let summary = parser.resolution_summary();
+        let map: HashMap<String, String> = summary.into_iter().collect();
+        assert_eq!(map.get("Mode").unwrap(), "ssh");
+        assert!(map.get("Playbook").unwrap().ends_with("play.yml"));
+        assert_eq!(map.get("Inventory").unwrap(), "(none)");
+    }
+
+    #[test]
+    fn resolution_summary_reports_secrets_profile_and_source() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("pb")).unwrap();
+        fs::create_dir_all(root.join("inv")).unwrap();
+        fs::create_dir_all(root.join("sec")).unwrap();
+        fs::write(root.join("pb/install.yml"), "---\n").unwrap();
+        fs::write(
+            root.join(".jetpack.yml"),
+            "version: 1\ndefaults:\n  playbook: pb/install.yml\n  inventory: [inv]\n  \
+             secrets_inventory: [sec]\n  profile: london\nprofiles:\n  london:\n    \
+             inventory: [inv]\nautomation:\n  source: https://example.com/moosefs\n",
+        )
+        .unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+
+        let mut parser = CliParser::new();
+        parser
+            .parse_from_strings(vec!["jetp".into(), "apply".into()])
+            .unwrap();
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        let map: HashMap<String, String> = parser.resolution_summary().into_iter().collect();
+        assert!(map["Secrets"].ends_with("sec"));
+        assert_eq!(map["Profile"], "london");
+        assert!(map["Automation source"].contains("https://example.com/moosefs"));
+        assert!(
+            map["Automation source"].contains("not yet implemented"),
+            "source must be flagged as not-yet-fetched: {}",
+            map["Automation source"]
+        );
+    }
+
+    #[test]
+    fn resolution_summary_marks_secrets_skipped_under_no_secrets() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("pb")).unwrap();
+        fs::create_dir_all(root.join("inv")).unwrap();
+        fs::create_dir_all(root.join("sec")).unwrap();
+        fs::write(root.join("pb/install.yml"), "---\n").unwrap();
+        fs::write(
+            root.join(".jetpack.yml"),
+            "version: 1\ndefaults:\n  playbook: pb/install.yml\n  inventory: [inv]\n  \
+             secrets_inventory: [sec]\n",
+        )
+        .unwrap();
+
+        let previous_dir = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+
+        let mut parser = CliParser::new();
+        parser
+            .parse_from_strings(vec!["jetp".into(), "apply".into(), "--no-secrets".into()])
+            .unwrap();
+
+        env::set_current_dir(previous_dir).unwrap();
+
+        let map: HashMap<String, String> = parser.resolution_summary().into_iter().collect();
+        assert_eq!(map["Secrets"], "(skipped via --no-secrets)");
     }
 
     #[test]
@@ -1658,4 +3499,45 @@ fn parse_paths(from: &str, value: &str) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(results)
+}
+
+/// Resolve a `-p`/`--playbook` (or `defaults.playbook`) segment to a concrete
+/// playbook file.
+///
+/// A segment may be a file (used directly) or a directory. For a directory we
+/// probe, in order: `main.yml`, `main.yaml`, `<dirname>.yml`, `<dirname>.yaml`
+/// — first match wins — so `-p playbooks/gravity` runs `gravity/gravity.yml`
+/// (its namesake) while `-p playbooks/web` (with only `main.yml`) runs
+/// `main.yml`. The resolved file's parent dir becomes `JET_PLAYBOOK_DIR`
+/// (derived in `inject_builtin_vars`), so a directory argument keeps the
+/// "modules/roles siblings auto-discover" behavior pointed at the directory the
+/// user named.
+fn resolve_playbook_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if path.is_dir() {
+        let dirname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("playbook directory has no name: {}", path.display()))?;
+        let candidates: [String; 4] = [
+            "main.yml".to_string(),
+            "main.yaml".to_string(),
+            format!("{dirname}.yml"),
+            format!("{dirname}.yaml"),
+        ];
+        for candidate in &candidates {
+            let entry = path.join(candidate);
+            if entry.is_file() {
+                return Ok(entry);
+            }
+        }
+        return Err(format!(
+            "no playbook entry in {} (looked for main.yml, main.yaml, {dirname}.yml, \
+             {dirname}.yaml)",
+            path.display()
+        ));
+    }
+    Err(format!("playbook file missing: {}", path.display()))
 }

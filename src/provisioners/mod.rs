@@ -39,7 +39,7 @@ pub mod proxmox_vm;
 
 use crate::dns::DnsConfig;
 use crate::inventory::inventory::Inventory;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -50,7 +50,7 @@ fn default_state() -> String {
 }
 
 /// Configuration for provisioning a host's underlying infrastructure
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProvisionConfig {
     /// The type of provisioner (e.g., "proxmox_lxc", "proxmox_vm", "docker")
     #[serde(rename = "type")]
@@ -68,6 +68,11 @@ pub struct ProvisionConfig {
 
     /// Hostname for the VM/container (defaults to inventory name if not specified)
     pub hostname: Option<String>,
+
+    /// Static IPv4 address for the VM (e.g. "10.7.1.241"). When set it is sent to
+    /// Dragonfly's admin/create so cloud-init bakes a static config, and becomes
+    /// the SSH target. When unset, the VM is precreated in DHCP mode.
+    pub ip: Option<String>,
 
     /// VM ID (optional - auto-assigned if not specified)
     pub vmid: Option<String>,
@@ -155,8 +160,10 @@ pub enum ProvisionResult {
     Created,
     /// Host was updated (config changed)
     Updated,
-    /// Host was destroyed (state: absent)
+    /// Host was destroyed (state: absent / destroyed)
     Destroyed,
+    /// Host was stopped (state: stopped)
+    Stopped,
 }
 
 /// Wait strategy for SSH connection attempts
@@ -174,6 +181,47 @@ impl WaitStrategy {
             "simple" => WaitStrategy::Simple,
             _ => WaitStrategy::Backoff,
         }
+    }
+}
+
+/// Desired lifecycle state for a provisioned host, parsed from `ProvisionConfig.state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionState {
+    /// Ensure the host exists and is running (default).
+    Present,
+    /// Ensure the host is stopped — stop if running, no-op otherwise.
+    Stopped,
+    /// Destroy the host, but only if it is already stopped (refuses a running host).
+    Absent,
+    /// Stop + destroy in one shot (explicit force). `force-absent` is a deprecated alias.
+    Destroyed,
+}
+
+impl ProvisionState {
+    /// Parse a state string. Accepts `present`, `stopped`, `absent`, `destroyed`,
+    /// and the deprecated `force-absent` alias (→ `Destroyed`). Any other value is
+    /// an error so a typo can't silently fall through to provisioning.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "present" => Ok(ProvisionState::Present),
+            "stopped" => Ok(ProvisionState::Stopped),
+            "absent" => Ok(ProvisionState::Absent),
+            "destroyed" | "force-absent" => Ok(ProvisionState::Destroyed),
+            other => Err(format!(
+                "unknown provision state {:?}: expected present, stopped, absent, or destroyed",
+                other
+            )),
+        }
+    }
+}
+
+/// Safety gate for destruction: `absent` on a running host is refused.
+/// `destroyed` (and the `force-absent` alias) always proceeds.
+pub fn refuse_destroy_if_running(state: ProvisionState, is_running: bool) -> Result<(), String> {
+    if state == ProvisionState::Absent && is_running {
+        Err("host is running; set state: stopped first, or state: destroyed to force".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -322,6 +370,15 @@ pub trait Provisioner: Send + Sync {
         inventory_name: &str,
         inventory: &Arc<RwLock<Inventory>>,
     ) -> Result<(), String>;
+
+    /// Ensure the host is stopped (state: stopped). Stop if running; no-op if
+    /// absent or already stopped. Returns `Stopped` or `AlreadyExists`.
+    fn stop(
+        &self,
+        config: &ProvisionConfig,
+        inventory_name: &str,
+        inventory: &Arc<RwLock<Inventory>>,
+    ) -> Result<ProvisionResult, String>;
 }
 
 /// Get the appropriate provisioner for a provision type
@@ -343,10 +400,20 @@ pub fn ensure_host_provisioned(
     dns_config: Option<&DnsConfig>,
     output: Option<&crate::output::OutputHandlerRef>,
 ) -> Result<ProvisionResult, String> {
-    // Handle state: absent / force-absent - destroy instead of provision
-    if provision_config.state == "absent" || provision_config.state == "force-absent" {
-        destroy_host(provision_config, inventory_name, inventory, dns_config)?;
-        return Ok(ProvisionResult::Destroyed);
+    // Route by desired state. Parsing here also rejects unknown states so a
+    // typo can't silently fall through to provisioning.
+    let state = ProvisionState::parse(&provision_config.state)?;
+    match state {
+        ProvisionState::Absent | ProvisionState::Destroyed => {
+            destroy_host(provision_config, inventory_name, inventory, dns_config)?;
+            return Ok(ProvisionResult::Destroyed);
+        }
+        ProvisionState::Stopped => {
+            let provisioner = get_provisioner(&provision_config.provision_type)?;
+            provisioner.stop(provision_config, inventory_name, inventory)?;
+            return Ok(ProvisionResult::Stopped);
+        }
+        ProvisionState::Present => {} // fall through to provision
     }
 
     let provisioner = get_provisioner(&provision_config.provision_type)?;
@@ -497,6 +564,20 @@ cores: "2"
     }
 
     #[test]
+    fn test_provision_config_deserializes_ip() {
+        let yaml = r#"
+type: proxmox_vm
+cluster: hypervisor1
+hostname: k8s01
+ip: "10.7.1.241"
+"#;
+        let config: ProvisionConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.ip.as_deref(), Some("10.7.1.241"));
+        // `ip` is a named field — it must not also leak into the extra map.
+        assert!(config.extra.is_empty());
+    }
+
+    #[test]
     fn test_provision_config_with_mountpoints() {
         let yaml = r#"
 type: proxmox_lxc
@@ -632,5 +713,55 @@ mp0: "local-lvm:50,mp=/mnt/extra"
         assert_eq!(WaitStrategy::parse("SIMPLE"), WaitStrategy::Simple);
         assert_eq!(WaitStrategy::parse("backoff"), WaitStrategy::Backoff);
         assert_eq!(WaitStrategy::parse("anything_else"), WaitStrategy::Backoff);
+    }
+
+    #[test]
+    fn provision_state_parse_accepts_all_states_and_alias() {
+        assert_eq!(
+            ProvisionState::parse("present").unwrap(),
+            ProvisionState::Present
+        );
+        assert_eq!(
+            ProvisionState::parse("stopped").unwrap(),
+            ProvisionState::Stopped
+        );
+        assert_eq!(
+            ProvisionState::parse("absent").unwrap(),
+            ProvisionState::Absent
+        );
+        assert_eq!(
+            ProvisionState::parse("destroyed").unwrap(),
+            ProvisionState::Destroyed
+        );
+        // deprecated alias maps to Destroyed
+        assert_eq!(
+            ProvisionState::parse("force-absent").unwrap(),
+            ProvisionState::Destroyed
+        );
+    }
+
+    #[test]
+    fn provision_state_parse_rejects_unknown_state() {
+        assert!(ProvisionState::parse("absnet").is_err()); // typo
+        assert!(ProvisionState::parse("running").is_err());
+        assert!(ProvisionState::parse("").is_err());
+    }
+
+    #[test]
+    fn refuse_destroy_if_running_absent_running_is_refused() {
+        let err = refuse_destroy_if_running(ProvisionState::Absent, true).unwrap_err();
+        assert!(err.contains("running"), "got: {err}");
+        assert!(err.contains("stopped"), "got: {err}");
+        assert!(err.contains("destroyed"), "got: {err}");
+    }
+
+    #[test]
+    fn refuse_destroy_if_running_absent_stopped_is_allowed() {
+        assert!(refuse_destroy_if_running(ProvisionState::Absent, false).is_ok());
+    }
+
+    #[test]
+    fn refuse_destroy_if_running_destroyed_is_allowed_when_running() {
+        assert!(refuse_destroy_if_running(ProvisionState::Destroyed, true).is_ok());
     }
 }
