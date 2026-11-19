@@ -23,9 +23,6 @@ builds:
     platforms:
       - linux/amd64
   image:
-    kind: docker
-    platforms:
-      - linux/amd64
     stage:
       as: jetpack-{arch}
       from: bin
