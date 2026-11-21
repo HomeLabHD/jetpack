@@ -38,6 +38,11 @@ fn command(tag: &str, cmd: &str, dir: Option<&str>) -> Task {
     if let Some(dir) = dir {
         input.insert("chdir".into(), dir.into());
     }
+    if tag == "shell" {
+        // These tests are about chdir, not the default shell: /bin/bash is not on every
+        // host that runs the suite (Alpine, NixOS), while sh is.
+        input.insert("shell".into(), "sh".into());
+    }
     let body = serde_yaml::to_string(&input).unwrap();
     serde_yaml::from_str(&format!("!{tag}\n{body}")).unwrap()
 }
