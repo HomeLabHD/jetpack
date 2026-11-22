@@ -113,3 +113,5 @@ upstream:
   sources:
     upstream:
       prereleases: true
+  sync:
+    branch: HEAD
